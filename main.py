@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any, Dict
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -38,7 +39,10 @@ class RegistrationStates(StatesGroup):
 
 
 router = Router()
-bot = Bot(CONFIG.telegram_token, parse_mode=ParseMode.HTML)
+bot = Bot(
+    token=CONFIG.telegram_token,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(router)
 
