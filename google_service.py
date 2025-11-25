@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
+import time
 import uuid
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Callable, Dict, List, Optional
 
 from google.auth import default as google_default_credentials
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from config import CONFIG
 
@@ -70,10 +74,39 @@ _users_cache: List[Dict[str, str]] | None = None
 
 
 def _get_credentials():
-    if CONFIG.google_credentials_file and CONFIG.google_credentials_file.exists():
-        return service_account.Credentials.from_service_account_file(str(CONFIG.google_credentials_file), scopes=SCOPES)
+    creds_file = CONFIG.google_credentials_file
+    if creds_file:
+        creds_path = Path(creds_file)
+        if not creds_path.exists():
+            logger.error("Credentials file missing: %s", creds_path)
+            raise RuntimeError("Не найден или некорректен файл сервисного аккаунта")
+        try:
+            data = json.loads(creds_path.read_text(encoding="utf-8"))
+            if data.get("type") != "service_account":
+                raise ValueError("Not a service account JSON")
+            return service_account.Credentials.from_service_account_info(data, scopes=SCOPES)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to read credentials: %s", exc)
+            raise RuntimeError("Не найден или некорректен файл сервисного аккаунта") from exc
     creds, _ = google_default_credentials(scopes=SCOPES)
     return creds
+
+
+def _with_retries(func: Callable, *args, **kwargs):
+    for attempt in range(3):
+        try:
+            return func(*args, **kwargs)
+        except HttpError as exc:
+            status = getattr(exc, "status_code", None) or getattr(exc, "resp", None)
+            logger.warning("Google API error on attempt %s: %s", attempt + 1, exc)
+            if attempt >= 1:
+                raise
+            time.sleep(1 + attempt)
+        except OSError as exc:  # network issues
+            logger.warning("Network error on attempt %s: %s", attempt + 1, exc)
+            if attempt >= 1:
+                raise
+            time.sleep(1 + attempt)
 
 
 def get_sheets_service():
@@ -91,7 +124,9 @@ def get_calendar_service():
 
 
 def _sheet_exists(name: str) -> bool:
-    sheets = get_sheets_service().spreadsheets().get(spreadsheetId=CONFIG.sheets_id).execute()
+    sheets = _with_retries(
+        get_sheets_service().spreadsheets().get(spreadsheetId=CONFIG.sheets_id).execute
+    )
     return any(s.get("properties", {}).get("title") == name for s in sheets.get("sheets", []))
 
 
@@ -99,51 +134,73 @@ def _create_sheet_if_missing(name: str, headers: List[str]) -> None:
     if _sheet_exists(name):
         return
     body = {"requests": [{"addSheet": {"properties": {"title": name}}}]}
-    get_sheets_service().spreadsheets().batchUpdate(spreadsheetId=CONFIG.sheets_id, body=body).execute()
-    get_sheets_service().spreadsheets().values().update(
-        spreadsheetId=CONFIG.sheets_id,
-        range=f"{name}!A1:{chr(64 + len(headers))}1",
-        valueInputOption="RAW",
-        body={"values": [headers]},
-    ).execute()
+    _with_retries(get_sheets_service().spreadsheets().batchUpdate(spreadsheetId=CONFIG.sheets_id, body=body).execute)
+    _with_retries(
+        get_sheets_service().spreadsheets().values().update(
+            spreadsheetId=CONFIG.sheets_id,
+            range=f"{name}!A1:{chr(64 + len(headers))}1",
+            valueInputOption="RAW",
+            body={"values": [headers]},
+        ).execute
+    )
 
 
 def ensure_structures() -> None:
-    _create_sheet_if_missing(USERS_SHEET, USERS_COLUMNS)
-    _create_sheet_if_missing(PERSONAL_NOTES_SHEET, PERSONAL_NOTES_COLUMNS)
-    _create_sheet_if_missing(PERSONAL_TASKS_SHEET, PERSONAL_TASKS_COLUMNS)
-    _create_sheet_if_missing(TEAM_TASKS_SHEET, TEAM_TASKS_COLUMNS)
+    try:
+        _create_sheet_if_missing(USERS_SHEET, USERS_COLUMNS)
+        _create_sheet_if_missing(PERSONAL_NOTES_SHEET, PERSONAL_NOTES_COLUMNS)
+        _create_sheet_if_missing(PERSONAL_TASKS_SHEET, PERSONAL_TASKS_COLUMNS)
+        _create_sheet_if_missing(TEAM_TASKS_SHEET, TEAM_TASKS_COLUMNS)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to ensure Google structures: %s", exc)
+        raise
 
 
 # Helpers
 
 def _read_values(sheet: str) -> List[List[str]]:
-    result = (
-        get_sheets_service()
-        .spreadsheets()
-        .values()
-        .get(spreadsheetId=CONFIG.sheets_id, range=f"{sheet}!A2:Z")
-        .execute()
-    )
-    return result.get("values", [])
+    try:
+        result = _with_retries(
+            get_sheets_service()
+            .spreadsheets()
+            .values()
+            .get(spreadsheetId=CONFIG.sheets_id, range=f"{sheet}!A2:Z")
+            .execute
+        )
+        return result.get("values", [])
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to read sheet %s: %s", sheet, exc)
+        return []
 
 
 def _append_row(sheet: str, row: List[str]) -> None:
-    get_sheets_service().spreadsheets().values().append(
-        spreadsheetId=CONFIG.sheets_id,
-        range=f"{sheet}!A2",
-        valueInputOption="RAW",
-        body={"values": [row]},
-    ).execute()
+    try:
+        _with_retries(
+            get_sheets_service().spreadsheets().values().append(
+                spreadsheetId=CONFIG.sheets_id,
+                range=f"{sheet}!A2",
+                valueInputOption="RAW",
+                body={"values": [row]},
+            ).execute
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to append row to %s: %s", sheet, exc)
+        raise
 
 
 def _update_row(sheet: str, row_index: int, row: List[str]) -> None:
-    get_sheets_service().spreadsheets().values().update(
-        spreadsheetId=CONFIG.sheets_id,
-        range=f"{sheet}!A{row_index}:Z{row_index}",
-        valueInputOption="RAW",
-        body={"values": [row]},
-    ).execute()
+    try:
+        _with_retries(
+            get_sheets_service().spreadsheets().values().update(
+                spreadsheetId=CONFIG.sheets_id,
+                range=f"{sheet}!A{row_index}:Z{row_index}",
+                valueInputOption="RAW",
+                body={"values": [row]},
+            ).execute
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to update row in %s: %s", sheet, exc)
+        raise
 
 
 def _parse_bool(value: str) -> bool:
@@ -207,14 +264,20 @@ def _write_users(users: List[Dict[str, str]]) -> None:
         ]
         for u in users
     ]
-    get_sheets_service().spreadsheets().values().clear(spreadsheetId=CONFIG.sheets_id, range=f"{USERS_SHEET}!A2:Z").execute()
+    _with_retries(
+        get_sheets_service().spreadsheets().values().clear(
+            spreadsheetId=CONFIG.sheets_id, range=f"{USERS_SHEET}!A2:Z"
+        ).execute
+    )
     if body:
-        get_sheets_service().spreadsheets().values().append(
-            spreadsheetId=CONFIG.sheets_id,
-            range=f"{USERS_SHEET}!A2",
-            valueInputOption="RAW",
-            body={"values": body},
-        ).execute()
+        _with_retries(
+            get_sheets_service().spreadsheets().values().append(
+                spreadsheetId=CONFIG.sheets_id,
+                range=f"{USERS_SHEET}!A2",
+                valueInputOption="RAW",
+                body={"values": body},
+            ).execute
+        )
     global _users_cache
     _users_cache = users
 
@@ -226,20 +289,20 @@ def get_user_profile(telegram_user_id: int) -> dict | None:
     return None
 
 
-def create_or_update_user_profile(profile_dict: dict) -> dict:
+def create_or_update_user_profile(profile: dict) -> dict:
     ensure_structures()
     users = _read_users()
     for idx, user in enumerate(users):
-        if str(user.get("telegram_user_id")) == str(profile_dict.get("telegram_user_id")):
-            updated = {**user, **profile_dict, "last_seen_at": _now_iso()}
+        if str(user.get("telegram_user_id")) == str(profile.get("telegram_user_id")):
+            updated = {**user, **profile, "last_seen_at": _now_iso()}
             users[idx] = updated
             _write_users(users)
             return updated
     profile = {
-        "user_id": profile_dict.get("user_id") or str(profile_dict.get("telegram_user_id")),
-        **profile_dict,
-        "created_at": profile_dict.get("created_at") or _now_iso(),
-        "last_seen_at": profile_dict.get("last_seen_at") or _now_iso(),
+        "user_id": profile.get("user_id") or str(profile.get("telegram_user_id")),
+        **profile,
+        "created_at": profile.get("created_at") or _now_iso(),
+        "last_seen_at": profile.get("last_seen_at") or _now_iso(),
     }
     users.append(profile)
     _write_users(users)
@@ -260,15 +323,18 @@ def update_last_seen(telegram_user_id: int) -> None:
 
 # Notes
 
-def create_personal_note(profile: dict, note_text: str, tags: Optional[List[str]] = None) -> str:
-    note_id = str(uuid.uuid4())
-    now = _now_iso()
-    tags_str = ",".join(tags or [])
-    _append_row(PERSONAL_NOTES_SHEET, [note_id, str(profile.get("user_id")), note_text, now, now, tags_str])
-    return f"Заметка сохранена (id={note_id})."
+def create_personal_note(profile: dict, note_text: str, tags: Optional[List[str]] = None, **_: str) -> str:
+    try:
+        note_id = str(uuid.uuid4())
+        now = _now_iso()
+        tags_str = ",".join(tags or [])
+        _append_row(PERSONAL_NOTES_SHEET, [note_id, str(profile.get("user_id")), note_text, now, now, tags_str])
+        return f"Заметка сохранена (id={note_id})."
+    except Exception:  # noqa: BLE001
+        return "Не удалось выполнить действие с Google (таблица/календарь). Я пробовал несколько раз. Попробуйте позже."
 
 
-def read_personal_notes(profile: dict, limit: int = 5) -> str:
+def read_personal_notes(profile: dict, limit: int = 5, **_: str) -> str:
     notes = _read_values(PERSONAL_NOTES_SHEET)
     filtered = [n for n in notes if n and n[1] == str(profile.get("user_id"))]
     filtered = list(reversed(filtered))[: int(limit)]
@@ -278,7 +344,7 @@ def read_personal_notes(profile: dict, limit: int = 5) -> str:
     return "\n".join(lines)
 
 
-def search_personal_notes(profile: dict, query: str, limit: int = 5) -> str:
+def search_personal_notes(profile: dict, query: str, limit: int = 5, **_: str) -> str:
     notes = _read_values(PERSONAL_NOTES_SHEET)
     filtered = [n for n in notes if n and n[1] == str(profile.get("user_id")) and query.lower() in (n[2].lower())]
     filtered = filtered[: int(limit)]
@@ -287,7 +353,7 @@ def search_personal_notes(profile: dict, query: str, limit: int = 5) -> str:
     return "\n".join(f"• {n[2]}" for n in filtered)
 
 
-def update_personal_note(profile: dict, note_id: str, fields: Dict[str, str]) -> str:
+def update_personal_note(profile: dict, note_id: str, fields: Dict[str, str], **_: str) -> str:
     rows = _read_values(PERSONAL_NOTES_SHEET)
     for idx, row in enumerate(rows, start=2):
         if row and row[0] == note_id and row[1] == str(profile.get("user_id")):
@@ -299,7 +365,7 @@ def update_personal_note(profile: dict, note_id: str, fields: Dict[str, str]) ->
     return "Заметка не найдена."
 
 
-def delete_personal_note(profile: dict, note_id: str) -> str:
+def delete_personal_note(profile: dict, note_id: str, **_: str) -> str:
     rows = _read_values(PERSONAL_NOTES_SHEET)
     keep: List[List[str]] = []
     deleted = False
@@ -315,39 +381,53 @@ def delete_personal_note(profile: dict, note_id: str) -> str:
 
 
 def _write_sheet_without_headers(sheet: str, rows: List[List[str]]) -> None:
-    get_sheets_service().spreadsheets().values().clear(spreadsheetId=CONFIG.sheets_id, range=f"{sheet}!A2:Z").execute()
+    _with_retries(
+        get_sheets_service().spreadsheets().values().clear(spreadsheetId=CONFIG.sheets_id, range=f"{sheet}!A2:Z").execute
+    )
     if rows:
-        get_sheets_service().spreadsheets().values().append(
-            spreadsheetId=CONFIG.sheets_id,
-            range=f"{sheet}!A2",
-            valueInputOption="RAW",
-            body={"values": rows},
-        ).execute()
+        _with_retries(
+            get_sheets_service().spreadsheets().values().append(
+                spreadsheetId=CONFIG.sheets_id,
+                range=f"{sheet}!A2",
+                valueInputOption="RAW",
+                body={"values": rows},
+            ).execute
+        )
 
 
 # Tasks
 
 def create_personal_task(profile: dict, **params) -> str:
-    task_id = str(uuid.uuid4())
-    row = [
-        task_id,
-        str(profile.get("user_id")),
-        params.get("title", ""),
-        params.get("description", ""),
-        params.get("status", "todo"),
-        params.get("priority", "medium"),
-        params.get("due_datetime", ""),
-        ",".join(params.get("tags", [])) if isinstance(params.get("tags"), list) else params.get("tags", ""),
-        params.get("calendar_event_id", ""),
-    ]
-    _append_row(PERSONAL_TASKS_SHEET, row)
-    if CONFIG.calendar_id and params.get("due_datetime"):
-        attendees = _collect_attendees([profile.get("user_id")])
-        create_or_update_event(profile, title=params.get("title", ""), description=params.get("description", ""), start_datetime=params.get("due_datetime", ""), end_datetime=params.get("due_datetime", ""), attendees=attendees)
-    return f"Личная задача создана (id={task_id})."
+    try:
+        task_id = str(uuid.uuid4())
+        row = [
+            task_id,
+            str(profile.get("user_id")),
+            params.get("title", ""),
+            params.get("description", ""),
+            params.get("status", "todo"),
+            params.get("priority", "medium"),
+            params.get("due_datetime", ""),
+            ",".join(params.get("tags", [])) if isinstance(params.get("tags"), list) else params.get("tags", ""),
+            params.get("calendar_event_id", ""),
+        ]
+        _append_row(PERSONAL_TASKS_SHEET, row)
+        if CONFIG.calendar_id and params.get("due_datetime"):
+            attendees = _collect_attendees([profile.get("user_id")])
+            create_or_update_event(
+                profile,
+                title=params.get("title", ""),
+                description=params.get("description", ""),
+                start_datetime=params.get("due_datetime", ""),
+                end_datetime=params.get("due_datetime", ""),
+                attendees=attendees,
+            )
+        return f"Личная задача создана (id={task_id})."
+    except Exception:  # noqa: BLE001
+        return "Не удалось выполнить действие с Google (таблица/календарь). Я пробовал несколько раз. Попробуйте позже."
 
 
-def update_personal_task(profile: dict, task_id: str, fields: Dict[str, str]) -> str:
+def update_personal_task(profile: dict, task_id: str, fields: Dict[str, str], **_: str) -> str:
     rows = _read_values(PERSONAL_TASKS_SHEET)
     for idx, row in enumerate(rows, start=2):
         if row and row[0] == task_id and row[1] == str(profile.get("user_id")):
@@ -364,7 +444,7 @@ def update_personal_task(profile: dict, task_id: str, fields: Dict[str, str]) ->
     return "Задача не найдена."
 
 
-def list_personal_tasks(profile: dict, status: Optional[str] = None) -> str:
+def list_personal_tasks(profile: dict, status: Optional[str] = None, **_: str) -> str:
     rows = _read_values(PERSONAL_TASKS_SHEET)
     tasks = []
     for r in rows:
@@ -380,31 +460,41 @@ def list_personal_tasks(profile: dict, status: Optional[str] = None) -> str:
 
 
 def create_team_task(profile: dict, **params) -> str:
-    task_id = str(uuid.uuid4())
-    assignees = params.get("assignees", []) or []
-    if isinstance(assignees, str):
-        assignees = [a.strip() for a in assignees.split(",") if a.strip()]
-    assignee_ids = params.get("assignee_user_ids") or []
-    row = [
-        task_id,
-        profile.get("user_id", ""),
-        ",".join(assignee_ids),
-        params.get("title", ""),
-        params.get("description", ""),
-        ",".join(assignees),
-        params.get("status", "todo"),
-        params.get("priority", "medium"),
-        params.get("due_datetime", ""),
-        params.get("calendar_event_id", ""),
-    ]
-    _append_row(TEAM_TASKS_SHEET, row)
-    attendees = _collect_attendees(assignee_ids + [profile.get("user_id")])
-    if CONFIG.calendar_id and params.get("due_datetime"):
-        create_or_update_event(profile, title=params.get("title", ""), description=params.get("description", ""), start_datetime=params.get("due_datetime", ""), end_datetime=params.get("due_datetime", ""), attendees=attendees)
-    return f"Командная задача создана (id={task_id})."
+    try:
+        task_id = str(uuid.uuid4())
+        assignees = params.get("assignees", []) or []
+        if isinstance(assignees, str):
+            assignees = [a.strip() for a in assignees.split(",") if a.strip()]
+        assignee_ids = params.get("assignee_user_ids") or []
+        row = [
+            task_id,
+            profile.get("user_id", ""),
+            ",".join(assignee_ids),
+            params.get("title", ""),
+            params.get("description", ""),
+            ",".join(assignees),
+            params.get("status", "todo"),
+            params.get("priority", "medium"),
+            params.get("due_datetime", ""),
+            params.get("calendar_event_id", ""),
+        ]
+        _append_row(TEAM_TASKS_SHEET, row)
+        attendees = _collect_attendees(assignee_ids + [profile.get("user_id")])
+        if CONFIG.calendar_id and params.get("due_datetime"):
+            create_or_update_event(
+                profile,
+                title=params.get("title", ""),
+                description=params.get("description", ""),
+                start_datetime=params.get("due_datetime", ""),
+                end_datetime=params.get("due_datetime", ""),
+                attendees=attendees,
+            )
+        return f"Командная задача создана (id={task_id})."
+    except Exception:  # noqa: BLE001
+        return "Не удалось выполнить действие с Google (таблица/календарь). Я пробовал несколько раз. Попробуйте позже."
 
 
-def update_team_task(profile: dict, task_id: str, fields: Dict[str, str]) -> str:
+def update_team_task(profile: dict, task_id: str, fields: Dict[str, str], **_: str) -> str:
     rows = _read_values(TEAM_TASKS_SHEET)
     for idx, row in enumerate(rows, start=2):
         if row and row[0] == task_id:
@@ -421,7 +511,7 @@ def update_team_task(profile: dict, task_id: str, fields: Dict[str, str]) -> str
     return "Командная задача не найдена."
 
 
-def list_team_tasks(profile: dict, status: Optional[str] = None) -> str:
+def list_team_tasks(profile: dict, status: Optional[str] = None, **_: str) -> str:
     rows = _read_values(TEAM_TASKS_SHEET)
     tasks = []
     for r in rows:
@@ -460,45 +550,56 @@ def create_or_update_event(
     end_datetime: Optional[str] = None,
     attendees: Optional[List[str]] = None,
     link_task_id: Optional[str] = None,
+    **_: str,
 ) -> str:
     if not CONFIG.calendar_id:
         return "Календарь не сконфигурирован."
-    service = get_calendar_service()
-    event_body = {
-        "summary": title,
-        "description": description if not link_task_id else f"{description}\nСвязано с задачей: {link_task_id}",
-        "start": {"dateTime": start_datetime, "timeZone": profile.get("timezone", "UTC")},
-        "end": {"dateTime": end_datetime or start_datetime, "timeZone": profile.get("timezone", "UTC")},
-    }
-    attendees = attendees or []
-    if attendees:
-        event_body["attendees"] = [{"email": e} for e in attendees]
-    created = service.events().insert(calendarId=CONFIG.calendar_id, body=event_body, sendUpdates="all" if attendees else "none").execute()
-    return f"Событие создано ({created.get('id')})."
+    try:
+        service = get_calendar_service()
+        event_body = {
+            "summary": title,
+            "description": description if not link_task_id else f"{description}\nСвязано с задачей: {link_task_id}",
+            "start": {"dateTime": start_datetime, "timeZone": profile.get("timezone", "UTC")},
+            "end": {"dateTime": end_datetime or start_datetime, "timeZone": profile.get("timezone", "UTC")},
+        }
+        attendees = attendees or []
+        if attendees:
+            event_body["attendees"] = [{"email": e} for e in attendees]
+        created = _with_retries(
+            service.events().insert(calendarId=CONFIG.calendar_id, body=event_body, sendUpdates="all" if attendees else "none").execute
+        )
+        return f"Событие создано ({created.get('id')})."
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Calendar operation failed: %s", exc)
+        return "Не удалось выполнить действие с Google (таблица/календарь). Я пробовал несколько раз. Попробуйте позже."
 
 
-def show_calendar_agenda(profile: dict, from_datetime: Optional[str] = None, to_datetime: Optional[str] = None) -> str:
+def show_calendar_agenda(profile: dict, from_datetime: Optional[str] = None, to_datetime: Optional[str] = None, **_: str) -> str:
     if not CONFIG.calendar_id:
         return "Календарь не сконфигурирован."
-    service = get_calendar_service()
-    now_iso = dt.datetime.utcnow().isoformat() + "Z"
-    params = {
-        "calendarId": CONFIG.calendar_id,
-        "timeMin": (from_datetime or now_iso),
-        "maxResults": 10,
-        "singleEvents": True,
-        "orderBy": "startTime",
-    }
-    if to_datetime:
-        params["timeMax"] = to_datetime
-    events = service.events().list(**params).execute().get("items", [])
-    if not events:
-        return "Ближайших событий нет."
-    lines = []
-    for ev in events:
-        start = ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date")
-        lines.append(f"• {ev.get('summary')} — {start}")
-    return "\n".join(lines)
+    try:
+        service = get_calendar_service()
+        now_iso = dt.datetime.utcnow().isoformat() + "Z"
+        params = {
+            "calendarId": CONFIG.calendar_id,
+            "timeMin": (from_datetime or now_iso),
+            "maxResults": 10,
+            "singleEvents": True,
+            "orderBy": "startTime",
+        }
+        if to_datetime:
+            params["timeMax"] = to_datetime
+        events = _with_retries(service.events().list(**params).execute).get("items", [])
+        if not events:
+            return "Ближайших событий нет."
+        lines = []
+        for ev in events:
+            start = ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date")
+            lines.append(f"• {ev.get('summary')} — {start}")
+        return "\n".join(lines)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to read calendar: %s", exc)
+        return "Не удалось выполнить действие с Google (таблица/календарь). Я пробовал несколько раз. Попробуйте позже."
 
 
 # Context for AI
@@ -506,7 +607,7 @@ def show_calendar_agenda(profile: dict, from_datetime: Optional[str] = None, to_
 def build_context_for_user(profile: dict) -> dict:
     personal = list_personal_tasks(profile)
     team = list_team_tasks(profile)
-    summary = f"Личные задачи: {personal[:100]} | Командные задачи: {team[:100]}"
+    summary = f"Личные задачи: {personal[:200]} | Командные задачи: {team[:200]}"
     return {"summary": summary}
 
 
@@ -518,7 +619,6 @@ def upcoming_tasks_for_user(user_id: str, within_hours: int = 24) -> List[Dict[s
     now = dt.datetime.utcnow()
     soon = now + dt.timedelta(hours=within_hours)
     tasks: List[Dict[str, str]] = []
-    # personal
     for r in _read_values(PERSONAL_TASKS_SHEET):
         if not r or r[1] != str(user_id):
             continue
@@ -544,7 +644,6 @@ def upcoming_tasks_for_user(user_id: str, within_hours: int = 24) -> List[Dict[s
                     "is_soon": due_dt <= soon,
                 }
             )
-    # team
     for r in _read_values(TEAM_TASKS_SHEET):
         if not r:
             continue

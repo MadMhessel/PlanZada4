@@ -24,14 +24,6 @@ async def _run_sync(func: Callable, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
-def _default_help() -> str:
-    return (
-        "Я могу создавать и обновлять личные и командные задачи, заметки и события в календаре. "
-        "Например: 'создай задачу позвонить клиенту завтра в 18:00', "
-        "'добавь заметку про бюджет', 'покажи мои задачи'."
-    )
-
-
 METHOD_MAP: Dict[str, Callable] = {
     "write_personal_note": google_service.create_personal_note,
     "read_personal_notes": google_service.read_personal_notes,
@@ -46,25 +38,33 @@ METHOD_MAP: Dict[str, Callable] = {
     "list_team_tasks": google_service.list_team_tasks,
     "create_or_update_calendar_event": google_service.create_or_update_event,
     "show_calendar_agenda": google_service.show_calendar_agenda,
-    "show_help": _default_help,
+    "show_help": debug_service.default_help,
     "debug_on": debug_service.debug_on,
     "debug_off": debug_service.debug_off,
     "debug_status": debug_service.debug_status,
+    "chat": ai_service.free_chat,
 }
 
 
 async def execute_plan(profile: dict, plan: dict) -> CommandResult:
-    """Execute plan returned by AI with threshold handling."""
-    method = plan.get("method") or "clarify"
-    confidence = float(plan.get("confidence", 0))
-    params = plan.get("params") or {}
-    clarify_question = plan.get("clarify_question")
+    """Execute plan returned by AI with threshold handling and safety."""
+    try:
+        method = plan.get("method") or "chat"
+        confidence = float(plan.get("confidence", 0))
+        params = plan.get("params") or {}
+        clarify_question = plan.get("clarify_question")
+    except Exception:  # noqa: BLE001
+        logger.exception("Invalid plan structure: %s", plan)
+        return CommandResult(user_visible_answer="Не удалось обработать запрос. Попробуйте ещё раз.")
 
-    if confidence < CONFIG.thresholds.low:
-        return CommandResult(user_visible_answer=clarify_question or "Нужно уточнить запрос.", extra_data=plan)
+    if clarify_question:
+        return CommandResult(user_visible_answer=str(clarify_question))
 
-    if CONFIG.thresholds.low <= confidence < CONFIG.thresholds.high and clarify_question:
-        return CommandResult(user_visible_answer=clarify_question, extra_data=plan)
+    if confidence < CONFIG.ai_low_confidence:
+        return CommandResult(
+            user_visible_answer="Я не до конца уверен, как лучше обработать запрос. Попробуйте переформулировать или уточнить детали.",
+            extra_data=plan,
+        )
 
     handler = METHOD_MAP.get(method)
     if handler:
@@ -73,15 +73,20 @@ async def execute_plan(profile: dict, plan: dict) -> CommandResult:
                 result = await handler(profile, **params)
             else:
                 result = await _run_sync(handler, profile, **params)
-            if isinstance(result, CommandResult):
-                return result
-            if isinstance(result, str):
-                return CommandResult(user_visible_answer=result, extra_data=plan)
-            return CommandResult(user_visible_answer=plan.get("user_visible_answer") or "Готово.", extra_data=result)
+            command_result = result if isinstance(result, CommandResult) else CommandResult(user_visible_answer=str(result))
         except Exception as exc:  # noqa: BLE001
             logger.exception("Command failed: %s", exc)
-            return CommandResult(user_visible_answer=f"Ошибка выполнения: {exc}")
+            return CommandResult(
+                user_visible_answer="Во время обработки запроса произошла ошибка. Я записал её в лог и попробую продолжить работу.",
+            )
+    else:
+        chat_answer = await ai_service.free_chat(profile, question=plan.get("user_visible_answer") or params.get("question", ""))
+        command_result = CommandResult(user_visible_answer=chat_answer)
 
-    # fallback: chat
-    chat_answer = await ai_service.free_chat(plan.get("user_visible_answer") or "Расскажи подробнее", profile)
-    return CommandResult(user_visible_answer=chat_answer)
+    if debug_service.is_debug_enabled(int(profile.get("telegram_user_id", 0))):
+        debug_info = (
+            f"\n\n[debug] method={method}; topic={plan.get('topic')}; "
+            f"confidence={confidence:.2f}; params_keys={list(params.keys())}"
+        )
+        command_result.user_visible_answer = (command_result.user_visible_answer or "") + debug_info
+    return command_result

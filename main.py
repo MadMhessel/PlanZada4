@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
@@ -19,7 +20,12 @@ import command_service
 from config import CONFIG
 import google_service
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+LOG_PATH = Path(__file__).resolve().parent / "bot.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler()],
+)
 logger = logging.getLogger(__name__)
 
 
@@ -40,6 +46,7 @@ async def _start_registration(message: Message, state: FSMContext) -> None:
 
 async def _finalize_registration(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
+    now_iso = datetime.utcnow().isoformat()
     profile = {
         "user_id": str(message.from_user.id),
         "telegram_user_id": str(message.from_user.id),
@@ -52,8 +59,8 @@ async def _finalize_registration(message: Message, state: FSMContext) -> None:
         "role": "",
         "notify_calendar": "TRUE",
         "notify_telegram": "TRUE",
-        "created_at": datetime.utcnow().isoformat(),
-        "last_seen_at": datetime.utcnow().isoformat(),
+        "created_at": now_iso,
+        "last_seen_at": now_iso,
         "is_active": "TRUE",
     }
     google_service.create_or_update_user_profile(profile)
@@ -99,6 +106,17 @@ async def handle_start(message: Message, state: FSMContext) -> None:
     await _start_registration(message, state)
 
 
+@dp.message(Command("help"))
+async def handle_help(message: Message, state: FSMContext) -> None:
+    profile = google_service.get_user_profile(message.from_user.id) or {
+        "telegram_user_id": message.from_user.id,
+        "display_name": message.from_user.full_name,
+    }
+    await state.clear()
+    text = await command_service.execute_plan(profile, {"method": "show_help", "confidence": 1.0, "params": {}})
+    await message.answer(text.user_visible_answer or "Подсказка недоступна сейчас.")
+
+
 @dp.message(F.text)
 async def handle_any_message(message: Message, state: FSMContext) -> None:
     google_service.ensure_structures()
@@ -118,25 +136,34 @@ async def handle_any_message(message: Message, state: FSMContext) -> None:
 async def reminder_worker() -> None:
     google_service.ensure_structures()
     while True:
-        await asyncio.sleep(300)
-        for user in google_service.list_users():
-            if str(user.get("notify_telegram", "")).lower() not in {"true", "1", "yes", "y"}:
-                continue
-            telegram_id = user.get("telegram_user_id")
-            if not telegram_id:
-                continue
-            tasks = google_service.upcoming_tasks_for_user(user.get("user_id", ""))
-            if not tasks:
-                continue
-            text = await ai_service.build_reminder_text(tasks)
-            try:
-                await bot.send_message(int(telegram_id), text)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to send reminder: %s", exc)
+        try:
+            for user in google_service.list_users():
+                if str(user.get("notify_telegram", "")).lower() not in {"true", "1", "yes", "y"}:
+                    continue
+                telegram_id = user.get("telegram_user_id")
+                if not telegram_id:
+                    continue
+                tasks = google_service.upcoming_tasks_for_user(user.get("user_id", ""))
+                if not tasks:
+                    continue
+                text = await ai_service.build_reminder_text(tasks, user)
+                try:
+                    await bot.send_message(int(telegram_id), text)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to send reminder: %s", exc)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Error in reminder_worker: %s", e)
+        await asyncio.sleep(CONFIG.reminder_interval_seconds)
+
+
+def handle_unhandled_exception(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    logger.error("Unhandled exception: %s", context)
 
 
 async def main() -> None:
     google_service.ensure_structures()
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(handle_unhandled_exception)
     asyncio.create_task(reminder_worker())
     await dp.start_polling(bot)
 
