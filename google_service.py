@@ -6,18 +6,15 @@ import logging
 import uuid
 from typing import Dict, List, Optional
 
-from google.oauth2 import service_account
 from google.auth import default as google_default_credentials
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 from config import CONFIG
 
 logger = logging.getLogger(__name__)
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/calendar",
-]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/calendar"]
 
 USERS_SHEET = "Users"
 USERS_COLUMNS = [
@@ -48,7 +45,7 @@ PERSONAL_TASKS_COLUMNS = [
     "description",
     "status",
     "priority",
-    "due_date",
+    "due_datetime",
     "tags",
     "calendar_event_id",
 ]
@@ -63,7 +60,7 @@ TEAM_TASKS_COLUMNS = [
     "assignees",
     "status",
     "priority",
-    "due_date",
+    "due_datetime",
     "calendar_event_id",
 ]
 
@@ -74,10 +71,7 @@ _users_cache: List[Dict[str, str]] | None = None
 
 def _get_credentials():
     if CONFIG.google_credentials_file and CONFIG.google_credentials_file.exists():
-        logger.info("Using service account credentials from %s", CONFIG.google_credentials_file)
-        return service_account.Credentials.from_service_account_file(
-            str(CONFIG.google_credentials_file), scopes=SCOPES
-        )
+        return service_account.Credentials.from_service_account_file(str(CONFIG.google_credentials_file), scopes=SCOPES)
     creds, _ = google_default_credentials(scopes=SCOPES)
     return creds
 
@@ -105,16 +99,13 @@ def _create_sheet_if_missing(name: str, headers: List[str]) -> None:
     if _sheet_exists(name):
         return
     body = {"requests": [{"addSheet": {"properties": {"title": name}}}]}
-    get_sheets_service().spreadsheets().batchUpdate(
-        spreadsheetId=CONFIG.sheets_id, body=body
-    ).execute()
+    get_sheets_service().spreadsheets().batchUpdate(spreadsheetId=CONFIG.sheets_id, body=body).execute()
     get_sheets_service().spreadsheets().values().update(
         spreadsheetId=CONFIG.sheets_id,
         range=f"{name}!A1:{chr(64 + len(headers))}1",
         valueInputOption="RAW",
         body={"values": [headers]},
     ).execute()
-    logger.info("Created sheet %s with headers", name)
 
 
 def ensure_structures() -> None:
@@ -124,134 +115,7 @@ def ensure_structures() -> None:
     _create_sheet_if_missing(TEAM_TASKS_SHEET, TEAM_TASKS_COLUMNS)
 
 
-def _now_iso() -> str:
-    return dt.datetime.utcnow().isoformat()
-
-
-def _read_users() -> List[Dict[str, str]]:
-    global _users_cache
-    if _users_cache is not None:
-        return _users_cache
-    rows = _read_values(USERS_SHEET)
-    users: List[Dict[str, str]] = []
-    for r in rows:
-        if not r:
-            continue
-        users.append(
-            {
-                "user_id": r[0],
-                "telegram_user_id": r[1],
-                "telegram_username": r[2] if len(r) > 2 else "",
-                "telegram_full_name": r[3] if len(r) > 3 else "",
-                "display_name": r[4] if len(r) > 4 else "",
-                "email": r[5] if len(r) > 5 else "",
-                "calendar_email": r[6] if len(r) > 6 else "",
-                "timezone": r[7] if len(r) > 7 else "",
-                "role": r[8] if len(r) > 8 else "",
-                "notify_calendar": r[9] if len(r) > 9 else "FALSE",
-                "notify_telegram": r[10] if len(r) > 10 else "FALSE",
-                "created_at": r[11] if len(r) > 11 else "",
-                "last_seen_at": r[12] if len(r) > 12 else "",
-                "is_active": r[13] if len(r) > 13 else "TRUE",
-            }
-        )
-    _users_cache = users
-    return users
-
-
-def _write_users(users: List[Dict[str, str]]) -> None:
-    body = [
-        [
-            u.get("user_id", ""),
-            u.get("telegram_user_id", ""),
-            u.get("telegram_username", ""),
-            u.get("telegram_full_name", ""),
-            u.get("display_name", ""),
-            u.get("email", ""),
-            u.get("calendar_email", ""),
-            u.get("timezone", ""),
-            u.get("role", ""),
-            str(u.get("notify_calendar", "FALSE")),
-            str(u.get("notify_telegram", "FALSE")),
-            u.get("created_at", ""),
-            u.get("last_seen_at", ""),
-            str(u.get("is_active", "TRUE")),
-        ]
-        for u in users
-    ]
-    get_sheets_service().spreadsheets().values().clear(
-        spreadsheetId=CONFIG.sheets_id, range=f"{USERS_SHEET}!A2:Z"
-    ).execute()
-    if body:
-        get_sheets_service().spreadsheets().values().append(
-            spreadsheetId=CONFIG.sheets_id,
-            range=f"{USERS_SHEET}!A2",
-            valueInputOption="RAW",
-            body={"values": body},
-        ).execute()
-    global _users_cache
-    _users_cache = users
-
-
-def list_users() -> List[Dict[str, str]]:
-    return list(_read_users())
-
-
-def get_user_by_telegram_id(telegram_user_id: int) -> Dict[str, str] | None:
-    return next((u for u in _read_users() if str(telegram_user_id) == str(u.get("telegram_user_id"))), None)
-
-
-def create_user(profile: Dict[str, str]) -> Dict[str, str]:
-    ensure_structures()
-    users = _read_users()
-    users.append(profile)
-    _append_row(
-        USERS_SHEET,
-        [
-            profile.get("user_id", ""),
-            profile.get("telegram_user_id", ""),
-            profile.get("telegram_username", ""),
-            profile.get("telegram_full_name", ""),
-            profile.get("display_name", ""),
-            profile.get("email", ""),
-            profile.get("calendar_email", profile.get("email", "")),
-            profile.get("timezone", ""),
-            profile.get("role", ""),
-            str(profile.get("notify_calendar", "FALSE")),
-            str(profile.get("notify_telegram", "FALSE")),
-            profile.get("created_at", _now_iso()),
-            profile.get("last_seen_at", _now_iso()),
-            str(profile.get("is_active", "TRUE")),
-        ],
-    )
-    _users_cache = None
-    return profile
-
-
-def update_user_last_seen(user_id: str) -> None:
-    users = _read_users()
-    changed = False
-    for u in users:
-        if u.get("user_id") == user_id:
-            u["last_seen_at"] = _now_iso()
-            changed = True
-            break
-    if changed:
-        _write_users(users)
-
-
-def update_user_fields_by_telegram(telegram_user_id: int, updates: Dict[str, str]) -> bool:
-    users = _read_users()
-    changed = False
-    for u in users:
-        if str(u.get("telegram_user_id")) == str(telegram_user_id):
-            u.update(updates)
-            changed = True
-            break
-    if changed:
-        _write_users(users)
-    return changed
-
+# Helpers
 
 def _read_values(sheet: str) -> List[List[str]]:
     result = (
@@ -282,264 +146,431 @@ def _update_row(sheet: str, row_index: int, row: List[str]) -> None:
     ).execute()
 
 
-def add_personal_note(user_id: int, text: str, tags: str) -> str:
-    note_id = str(uuid.uuid4())
-    now = dt.datetime.utcnow().isoformat()
-    _append_row(PERSONAL_NOTES_SHEET, [note_id, str(user_id), text, now, now, tags])
-    return note_id
-
-
-def list_personal_notes(user_id: int, limit: int = 5) -> List[Dict[str, str]]:
-    rows = _read_values(PERSONAL_NOTES_SHEET)
-    notes = [
-        {
-            "id": r[0],
-            "user_id": r[1],
-            "text": r[2],
-            "created_at": r[3],
-            "updated_at": r[4],
-            "tags": r[5] if len(r) > 5 else "",
-        }
-        for r in rows
-        if r and r[1] == str(user_id)
-    ]
-    return list(reversed(notes))[:limit]
-
-
-def search_personal_notes(user_id: int, query: str) -> List[Dict[str, str]]:
-    return [n for n in list_personal_notes(user_id, limit=100) if query.lower() in n["text"].lower()]
-
-
-def add_personal_task(user_id: int, data: Dict[str, str]) -> str:
-    task_id = str(uuid.uuid4())
-    row = [
-        task_id,
-        str(user_id),
-        data.get("title", ""),
-        data.get("description", ""),
-        data.get("status", "todo"),
-        data.get("priority", "medium"),
-        data.get("due_date", ""),
-        ",".join(data.get("tags", [])) if isinstance(data.get("tags"), list) else data.get("tags", ""),
-        data.get("calendar_event_id", ""),
-    ]
-    _append_row(PERSONAL_TASKS_SHEET, row)
-    return task_id
-
-
-def _update_personal_task(task_id: str, updater) -> bool:
-    rows = _read_values(PERSONAL_TASKS_SHEET)
-    for idx, row in enumerate(rows, start=2):
-        if row and row[0] == task_id:
-            new_row = updater(list(row))
-            _update_row(PERSONAL_TASKS_SHEET, idx, new_row)
-            return True
-    return False
-
-
-def update_personal_task_status(task_id: str, status: str) -> bool:
-    return _update_personal_task(task_id, lambda r: r[:4] + [status] + r[5:])
-
-
-def update_personal_task_due(task_id: str, due_date: str) -> bool:
-    return _update_personal_task(task_id, lambda r: r[:6] + [due_date] + r[7:])
-
-
-def list_personal_tasks(user_id: int, status: Optional[str] = None, due_before: Optional[str] = None) -> List[Dict[str, str]]:
-    rows = _read_values(PERSONAL_TASKS_SHEET)
-    tasks: List[Dict[str, str]] = []
-    for r in rows:
-        if not r or r[1] != str(user_id):
-            continue
-        task = {
-            "id": r[0],
-            "user_id": r[1],
-            "title": r[2],
-            "description": r[3],
-            "status": r[4],
-            "priority": r[5],
-            "due_date": r[6] if len(r) > 6 else "",
-            "tags": r[7] if len(r) > 7 else "",
-            "calendar_event_id": r[8] if len(r) > 8 else "",
-        }
-        if status and task["status"] != status:
-            continue
-        if due_before and task["due_date"] and task["due_date"] > due_before:
-            continue
-        tasks.append(task)
-    return tasks
-
-
-def add_team_task(data: Dict[str, str]) -> str:
-    task_id = str(uuid.uuid4())
-    row = [
-        task_id,
-        data.get("owner_user_id", ""),
-        ",".join(data.get("assignee_user_ids", [])) if isinstance(data.get("assignee_user_ids", []), list) else data.get("assignee_user_ids", ""),
-        data.get("title", ""),
-        data.get("description", ""),
-        data.get("assignees", ""),
-        data.get("status", "todo"),
-        data.get("priority", "medium"),
-        data.get("due_date", ""),
-        data.get("calendar_event_id", ""),
-    ]
-    _append_row(TEAM_TASKS_SHEET, row)
-    return task_id
-
-
-def _update_team_task(task_id: str, updater) -> bool:
-    rows = _read_values(TEAM_TASKS_SHEET)
-    for idx, row in enumerate(rows, start=2):
-        if row and row[0] == task_id:
-            new_row = updater(list(row))
-            _update_row(TEAM_TASKS_SHEET, idx, new_row)
-            return True
-    return False
-
-
-def update_team_task_status(task_id: str, status: str) -> bool:
-    return _update_team_task(task_id, lambda r: r[:6] + [status] + r[7:])
-
-
-def update_team_task_assignees(task_id: str, assignees: str) -> bool:
-    return _update_team_task(task_id, lambda r: r[:5] + [assignees] + r[6:])
-
-
-def list_team_tasks_by_assignee(name: str) -> List[Dict[str, str]]:
-    rows = _read_values(TEAM_TASKS_SHEET)
-    tasks = []
-    for r in rows:
-        if not r:
-            continue
-        if name.lower() not in (r[5] if len(r) > 5 else "").lower():
-            continue
-        tasks.append(
-            {
-                "id": r[0],
-                "owner_user_id": r[1] if len(r) > 1 else "",
-                "assignee_user_ids": r[2] if len(r) > 2 else "",
-                "title": r[3] if len(r) > 3 else "",
-                "description": r[4] if len(r) > 4 else "",
-                "assignees": r[5] if len(r) > 5 else "",
-                "status": r[6] if len(r) > 6 else "",
-                "priority": r[7] if len(r) > 7 else "",
-                "due_date": r[8] if len(r) > 8 else "",
-                "calendar_event_id": r[9] if len(r) > 9 else "",
-            }
-        )
-    return tasks
-
-
-def list_team_tasks_for_user_id(user_id: str) -> List[Dict[str, str]]:
-    rows = _read_values(TEAM_TASKS_SHEET)
-    tasks = []
-    for r in rows:
-        if not r:
-            continue
-        ids = (r[2] if len(r) > 2 else "").split(",")
-        if user_id not in ids:
-            continue
-        tasks.append(
-            {
-                "id": r[0],
-                "owner_user_id": r[1] if len(r) > 1 else "",
-                "assignee_user_ids": r[2] if len(r) > 2 else "",
-                "title": r[3] if len(r) > 3 else "",
-                "description": r[4] if len(r) > 4 else "",
-                "assignees": r[5] if len(r) > 5 else "",
-                "status": r[6] if len(r) > 6 else "",
-                "priority": r[7] if len(r) > 7 else "",
-                "due_date": r[8] if len(r) > 8 else "",
-                "calendar_event_id": r[9] if len(r) > 9 else "",
-            }
-        )
-    return tasks
-
-
 def _parse_bool(value: str) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes", "y"}
 
 
-def find_users_by_names(names: List[str]) -> List[Dict[str, str]]:
-    normalized = [n.strip().lower() for n in names if n]
-    if not normalized:
-        return []
-    users = []
-    for u in _read_users():
-        display = (u.get("display_name") or "").lower()
-        username = (u.get("telegram_username") or "").lower()
-        if any(n in display or (username and n in username) for n in normalized):
-            users.append(u)
+def _now_iso() -> str:
+    return dt.datetime.utcnow().isoformat()
+
+
+# Users
+
+def _read_users() -> List[Dict[str, str]]:
+    global _users_cache
+    if _users_cache is not None:
+        return _users_cache
+    rows = _read_values(USERS_SHEET)
+    users: List[Dict[str, str]] = []
+    for r in rows:
+        if not r:
+            continue
+        users.append(
+            {
+                "user_id": r[0],
+                "telegram_user_id": r[1],
+                "telegram_username": r[2] if len(r) > 2 else "",
+                "telegram_full_name": r[3] if len(r) > 3 else "",
+                "display_name": r[4] if len(r) > 4 else "",
+                "email": r[5] if len(r) > 5 else "",
+                "calendar_email": r[6] if len(r) > 6 else "",
+                "timezone": r[7] if len(r) > 7 else "",
+                "role": r[8] if len(r) > 8 else "",
+                "notify_calendar": r[9] if len(r) > 9 else "TRUE",
+                "notify_telegram": r[10] if len(r) > 10 else "TRUE",
+                "created_at": r[11] if len(r) > 11 else "",
+                "last_seen_at": r[12] if len(r) > 12 else "",
+                "is_active": r[13] if len(r) > 13 else "TRUE",
+            }
+        )
+    _users_cache = users
     return users
 
 
-def attendee_emails_for_users(user_ids: List[str]) -> List[str]:
+def _write_users(users: List[Dict[str, str]]) -> None:
+    body = [
+        [
+            u.get("user_id", ""),
+            u.get("telegram_user_id", ""),
+            u.get("telegram_username", ""),
+            u.get("telegram_full_name", ""),
+            u.get("display_name", ""),
+            u.get("email", ""),
+            u.get("calendar_email", ""),
+            u.get("timezone", ""),
+            u.get("role", ""),
+            str(u.get("notify_calendar", "TRUE")),
+            str(u.get("notify_telegram", "TRUE")),
+            u.get("created_at", ""),
+            u.get("last_seen_at", ""),
+            str(u.get("is_active", "TRUE")),
+        ]
+        for u in users
+    ]
+    get_sheets_service().spreadsheets().values().clear(spreadsheetId=CONFIG.sheets_id, range=f"{USERS_SHEET}!A2:Z").execute()
+    if body:
+        get_sheets_service().spreadsheets().values().append(
+            spreadsheetId=CONFIG.sheets_id,
+            range=f"{USERS_SHEET}!A2",
+            valueInputOption="RAW",
+            body={"values": body},
+        ).execute()
+    global _users_cache
+    _users_cache = users
+
+
+def get_user_profile(telegram_user_id: int) -> dict | None:
+    for u in _read_users():
+        if str(u.get("telegram_user_id")) == str(telegram_user_id):
+            return u
+    return None
+
+
+def create_or_update_user_profile(profile_dict: dict) -> dict:
+    ensure_structures()
+    users = _read_users()
+    for idx, user in enumerate(users):
+        if str(user.get("telegram_user_id")) == str(profile_dict.get("telegram_user_id")):
+            updated = {**user, **profile_dict, "last_seen_at": _now_iso()}
+            users[idx] = updated
+            _write_users(users)
+            return updated
+    profile = {
+        "user_id": profile_dict.get("user_id") or str(profile_dict.get("telegram_user_id")),
+        **profile_dict,
+        "created_at": profile_dict.get("created_at") or _now_iso(),
+        "last_seen_at": profile_dict.get("last_seen_at") or _now_iso(),
+    }
+    users.append(profile)
+    _write_users(users)
+    return profile
+
+
+def update_last_seen(telegram_user_id: int) -> None:
+    users = _read_users()
+    updated = False
+    for u in users:
+        if str(u.get("telegram_user_id")) == str(telegram_user_id):
+            u["last_seen_at"] = _now_iso()
+            updated = True
+            break
+    if updated:
+        _write_users(users)
+
+
+# Notes
+
+def create_personal_note(profile: dict, note_text: str, tags: Optional[List[str]] = None) -> str:
+    note_id = str(uuid.uuid4())
+    now = _now_iso()
+    tags_str = ",".join(tags or [])
+    _append_row(PERSONAL_NOTES_SHEET, [note_id, str(profile.get("user_id")), note_text, now, now, tags_str])
+    return f"Заметка сохранена (id={note_id})."
+
+
+def read_personal_notes(profile: dict, limit: int = 5) -> str:
+    notes = _read_values(PERSONAL_NOTES_SHEET)
+    filtered = [n for n in notes if n and n[1] == str(profile.get("user_id"))]
+    filtered = list(reversed(filtered))[: int(limit)]
+    if not filtered:
+        return "Заметок пока нет."
+    lines = [f"• {n[2]} (теги: {n[5] if len(n)>5 else ''})" for n in filtered]
+    return "\n".join(lines)
+
+
+def search_personal_notes(profile: dict, query: str, limit: int = 5) -> str:
+    notes = _read_values(PERSONAL_NOTES_SHEET)
+    filtered = [n for n in notes if n and n[1] == str(profile.get("user_id")) and query.lower() in (n[2].lower())]
+    filtered = filtered[: int(limit)]
+    if not filtered:
+        return "Ничего не найдено."
+    return "\n".join(f"• {n[2]}" for n in filtered)
+
+
+def update_personal_note(profile: dict, note_id: str, fields: Dict[str, str]) -> str:
+    rows = _read_values(PERSONAL_NOTES_SHEET)
+    for idx, row in enumerate(rows, start=2):
+        if row and row[0] == note_id and row[1] == str(profile.get("user_id")):
+            text = fields.get("note_text", row[2])
+            tags = fields.get("tags", row[5] if len(row) > 5 else "")
+            updated = [row[0], row[1], text, row[3], _now_iso(), ",".join(tags) if isinstance(tags, list) else tags]
+            _update_row(PERSONAL_NOTES_SHEET, idx, updated)
+            return "Заметка обновлена."
+    return "Заметка не найдена."
+
+
+def delete_personal_note(profile: dict, note_id: str) -> str:
+    rows = _read_values(PERSONAL_NOTES_SHEET)
+    keep: List[List[str]] = []
+    deleted = False
+    for row in rows:
+        if row and row[0] == note_id and row[1] == str(profile.get("user_id")):
+            deleted = True
+            continue
+        keep.append(row)
+    if deleted:
+        _write_sheet_without_headers(PERSONAL_NOTES_SHEET, keep)
+        return "Заметка удалена."
+    return "Заметка не найдена."
+
+
+def _write_sheet_without_headers(sheet: str, rows: List[List[str]]) -> None:
+    get_sheets_service().spreadsheets().values().clear(spreadsheetId=CONFIG.sheets_id, range=f"{sheet}!A2:Z").execute()
+    if rows:
+        get_sheets_service().spreadsheets().values().append(
+            spreadsheetId=CONFIG.sheets_id,
+            range=f"{sheet}!A2",
+            valueInputOption="RAW",
+            body={"values": rows},
+        ).execute()
+
+
+# Tasks
+
+def create_personal_task(profile: dict, **params) -> str:
+    task_id = str(uuid.uuid4())
+    row = [
+        task_id,
+        str(profile.get("user_id")),
+        params.get("title", ""),
+        params.get("description", ""),
+        params.get("status", "todo"),
+        params.get("priority", "medium"),
+        params.get("due_datetime", ""),
+        ",".join(params.get("tags", [])) if isinstance(params.get("tags"), list) else params.get("tags", ""),
+        params.get("calendar_event_id", ""),
+    ]
+    _append_row(PERSONAL_TASKS_SHEET, row)
+    if CONFIG.calendar_id and params.get("due_datetime"):
+        attendees = _collect_attendees([profile.get("user_id")])
+        create_or_update_event(profile, title=params.get("title", ""), description=params.get("description", ""), start_datetime=params.get("due_datetime", ""), end_datetime=params.get("due_datetime", ""), attendees=attendees)
+    return f"Личная задача создана (id={task_id})."
+
+
+def update_personal_task(profile: dict, task_id: str, fields: Dict[str, str]) -> str:
+    rows = _read_values(PERSONAL_TASKS_SHEET)
+    for idx, row in enumerate(rows, start=2):
+        if row and row[0] == task_id and row[1] == str(profile.get("user_id")):
+            new_row = list(row)
+            mapping = {"title": 2, "description": 3, "status": 4, "priority": 5, "due_datetime": 6, "tags": 7}
+            for key, pos in mapping.items():
+                if key in fields:
+                    val = fields[key]
+                    if key == "tags" and isinstance(val, list):
+                        val = ",".join(val)
+                    new_row[pos] = val
+            _update_row(PERSONAL_TASKS_SHEET, idx, new_row)
+            return "Задача обновлена."
+    return "Задача не найдена."
+
+
+def list_personal_tasks(profile: dict, status: Optional[str] = None) -> str:
+    rows = _read_values(PERSONAL_TASKS_SHEET)
+    tasks = []
+    for r in rows:
+        if not r or r[1] != str(profile.get("user_id")):
+            continue
+        if status and r[4] != status:
+            continue
+        tasks.append(r)
+    if not tasks:
+        return "Личных задач нет."
+    lines = [f"• {t[2]} [{t[4]}] до {t[6]}" for t in tasks]
+    return "\n".join(lines)
+
+
+def create_team_task(profile: dict, **params) -> str:
+    task_id = str(uuid.uuid4())
+    assignees = params.get("assignees", []) or []
+    if isinstance(assignees, str):
+        assignees = [a.strip() for a in assignees.split(",") if a.strip()]
+    assignee_ids = params.get("assignee_user_ids") or []
+    row = [
+        task_id,
+        profile.get("user_id", ""),
+        ",".join(assignee_ids),
+        params.get("title", ""),
+        params.get("description", ""),
+        ",".join(assignees),
+        params.get("status", "todo"),
+        params.get("priority", "medium"),
+        params.get("due_datetime", ""),
+        params.get("calendar_event_id", ""),
+    ]
+    _append_row(TEAM_TASKS_SHEET, row)
+    attendees = _collect_attendees(assignee_ids + [profile.get("user_id")])
+    if CONFIG.calendar_id and params.get("due_datetime"):
+        create_or_update_event(profile, title=params.get("title", ""), description=params.get("description", ""), start_datetime=params.get("due_datetime", ""), end_datetime=params.get("due_datetime", ""), attendees=attendees)
+    return f"Командная задача создана (id={task_id})."
+
+
+def update_team_task(profile: dict, task_id: str, fields: Dict[str, str]) -> str:
+    rows = _read_values(TEAM_TASKS_SHEET)
+    for idx, row in enumerate(rows, start=2):
+        if row and row[0] == task_id:
+            new_row = list(row)
+            mapping = {"title": 3, "description": 4, "assignees": 5, "status": 6, "priority": 7, "due_datetime": 8}
+            for key, pos in mapping.items():
+                if key in fields:
+                    val = fields[key]
+                    if key == "assignees" and isinstance(val, list):
+                        val = ",".join(val)
+                    new_row[pos] = val
+            _update_row(TEAM_TASKS_SHEET, idx, new_row)
+            return "Командная задача обновлена."
+    return "Командная задача не найдена."
+
+
+def list_team_tasks(profile: dict, status: Optional[str] = None) -> str:
+    rows = _read_values(TEAM_TASKS_SHEET)
+    tasks = []
+    for r in rows:
+        if not r:
+            continue
+        if status and r[6] != status:
+            continue
+        tasks.append(r)
+    if not tasks:
+        return "Командных задач нет."
+    lines = [f"• {t[3]} [{t[6]}] до {t[8]} (исполнители: {t[5]})" for t in tasks]
+    return "\n".join(lines)
+
+
+# Calendar
+
+def _collect_attendees(user_ids: List[str]) -> List[str]:
     emails: List[str] = []
     for uid in user_ids:
-        user = next((u for u in _read_users() if u.get("user_id") == uid), None)
-        if not user:
-            continue
-        if not _parse_bool(user.get("notify_calendar", "FALSE")):
-            continue
-        email = user.get("calendar_email") or user.get("email")
-        if email:
-            emails.append(email)
+        for user in _read_users():
+            if str(user.get("user_id")) != str(uid):
+                continue
+            if not _parse_bool(user.get("notify_calendar", "TRUE")):
+                continue
+            email = user.get("calendar_email") or user.get("email")
+            if email:
+                emails.append(email)
     return emails
 
 
-def create_or_update_calendar_event(
-    summary: str,
+def create_or_update_event(
+    profile: dict,
+    title: str,
     description: str,
     start_datetime: str,
     end_datetime: Optional[str] = None,
-    event_id: Optional[str] = None,
     attendees: Optional[List[str]] = None,
-    timezone: str = "UTC",
-) -> Optional[str]:
-    if not CONFIG.calendar_id or not start_datetime:
-        return event_id
+    link_task_id: Optional[str] = None,
+) -> str:
+    if not CONFIG.calendar_id:
+        return "Календарь не сконфигурирован."
     service = get_calendar_service()
     event_body = {
-        "summary": summary,
-        "description": description,
-        "start": {"dateTime": start_datetime, "timeZone": timezone},
-        "end": {"dateTime": end_datetime or start_datetime, "timeZone": timezone},
+        "summary": title,
+        "description": description if not link_task_id else f"{description}\nСвязано с задачей: {link_task_id}",
+        "start": {"dateTime": start_datetime, "timeZone": profile.get("timezone", "UTC")},
+        "end": {"dateTime": end_datetime or start_datetime, "timeZone": profile.get("timezone", "UTC")},
     }
+    attendees = attendees or []
     if attendees:
-        event_body["attendees"] = [{"email": email} for email in attendees]
-    params = {"calendarId": CONFIG.calendar_id, "sendUpdates": "all" if attendees else "none"}
-    if event_id:
-        service.events().update(eventId=event_id, body=event_body, **params).execute()
-        return event_id
-    created = service.events().insert(body=event_body, **params).execute()
-    return created.get("id")
+        event_body["attendees"] = [{"email": e} for e in attendees]
+    created = service.events().insert(calendarId=CONFIG.calendar_id, body=event_body, sendUpdates="all" if attendees else "none").execute()
+    return f"Событие создано ({created.get('id')})."
 
 
-def upcoming_tasks_for_user(user_id: str, within_hours: int = 6) -> List[Dict[str, str]]:
+def show_calendar_agenda(profile: dict, from_datetime: Optional[str] = None, to_datetime: Optional[str] = None) -> str:
+    if not CONFIG.calendar_id:
+        return "Календарь не сконфигурирован."
+    service = get_calendar_service()
+    now_iso = dt.datetime.utcnow().isoformat() + "Z"
+    params = {
+        "calendarId": CONFIG.calendar_id,
+        "timeMin": (from_datetime or now_iso),
+        "maxResults": 10,
+        "singleEvents": True,
+        "orderBy": "startTime",
+    }
+    if to_datetime:
+        params["timeMax"] = to_datetime
+    events = service.events().list(**params).execute().get("items", [])
+    if not events:
+        return "Ближайших событий нет."
+    lines = []
+    for ev in events:
+        start = ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date")
+        lines.append(f"• {ev.get('summary')} — {start}")
+    return "\n".join(lines)
+
+
+# Context for AI
+
+def build_context_for_user(profile: dict) -> dict:
+    personal = list_personal_tasks(profile)
+    team = list_team_tasks(profile)
+    summary = f"Личные задачи: {personal[:100]} | Командные задачи: {team[:100]}"
+    return {"summary": summary}
+
+
+def list_users() -> List[Dict[str, str]]:
+    return list(_read_users())
+
+
+def upcoming_tasks_for_user(user_id: str, within_hours: int = 24) -> List[Dict[str, str]]:
     now = dt.datetime.utcnow()
     soon = now + dt.timedelta(hours=within_hours)
-    output: List[Dict[str, str]] = []
-    try:
-        personal = list_personal_tasks(int(user_id), None, None)
-    except (TypeError, ValueError):
-        personal = []
-    for t in personal:
-        if not t.get("due_date"):
+    tasks: List[Dict[str, str]] = []
+    # personal
+    for r in _read_values(PERSONAL_TASKS_SHEET):
+        if not r or r[1] != str(user_id):
+            continue
+        due = r[6] if len(r) > 6 else ""
+        if not due:
             continue
         try:
-            due = dt.datetime.fromisoformat(t["due_date"])
-        except ValueError:
+            due_dt = dt.datetime.fromisoformat(due)
+        except Exception:  # noqa: BLE001
             continue
-        if due <= soon:
-            output.append({**t, "scope": "personal", "is_overdue": due < now, "is_soon": due <= soon})
-    for t in list_team_tasks_for_user_id(user_id):
-        if not t.get("due_date"):
+        if due_dt <= soon:
+            tasks.append(
+                {
+                    "id": r[0],
+                    "scope": "personal",
+                    "title": r[2],
+                    "description": r[3],
+                    "status": r[4],
+                    "priority": r[5],
+                    "due_datetime": due,
+                    "assignees": [],
+                    "is_overdue": due_dt < now,
+                    "is_soon": due_dt <= soon,
+                }
+            )
+    # team
+    for r in _read_values(TEAM_TASKS_SHEET):
+        if not r:
+            continue
+        assignees_ids = (r[2] if len(r) > 2 else "").split(",")
+        if str(user_id) not in assignees_ids:
+            continue
+        due = r[8] if len(r) > 8 else ""
+        if not due:
             continue
         try:
-            due = dt.datetime.fromisoformat(t["due_date"])
-        except ValueError:
+            due_dt = dt.datetime.fromisoformat(due)
+        except Exception:  # noqa: BLE001
             continue
-        if due <= soon:
-            output.append({**t, "scope": "team", "is_overdue": due < now, "is_soon": due <= soon})
-    return output
+        if due_dt <= soon:
+            tasks.append(
+                {
+                    "id": r[0],
+                    "scope": "team",
+                    "title": r[3],
+                    "description": r[4],
+                    "status": r[6],
+                    "priority": r[7],
+                    "due_datetime": due,
+                    "assignees": (r[5] if len(r) > 5 else "").split(","),
+                    "is_overdue": due_dt < now,
+                    "is_soon": due_dt <= soon,
+                }
+            )
+    return tasks
