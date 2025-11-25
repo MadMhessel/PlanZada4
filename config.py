@@ -44,7 +44,7 @@ class Config:
         calendar_id = os.getenv("GOOGLE_CALENDAR_ID")
         creds_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         log_path = Path(os.getenv("DIALOG_LOG_PATH", "dialog_log.jsonl")).resolve()
-        ai_model = os.getenv("GENAI_MODEL", "gemini-1.5-pro-latest")
+        ai_model = os.getenv("GENAI_MODEL", "gemini-3-pro-preview")
         return Config(
             telegram_token=token,
             google_project_id=os.getenv("GOOGLE_PROJECT_ID"),
