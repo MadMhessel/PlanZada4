@@ -1,0 +1,8 @@
+aiogram>=3.6.0
+cryptography>=42.0.5
+google-generativeai>=0.5.0
+google-api-python-client>=2.127.0
+google-auth>=2.28.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.0
+python-dotenv>=1.0.1
