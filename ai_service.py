@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from string import Template
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import google.generativeai as genai
 
@@ -46,7 +46,9 @@ SYSTEM_PROMPT_MAIN = Template(
 - user_text: строка — оригинальный текст запроса пользователя.
 - optional_context: опциональный текст с краткой выпиской задач/заметок или текущим временем
   (если в контексте явно указано "Текущее время: 2025-11-25 21:10", относительные выражения
-  типа "завтра вечером" нужно считать относительно этого времени).
+  типа "завтра вечером" нужно считать относительно этого времени). В контексте также может быть
+  краткое описание профиля пользователя (имя, роль, часовой пояс, e-mail) — используй эти данные
+  для интерпретации относительных дат и подбора исполнителей.
 
 ТВОЙ ВЫХОД — один JSON-объект строго такого вида:
 
@@ -142,6 +144,7 @@ SYSTEM_PROMPT_MAIN = Template(
      "due_datetime": "YYYY-MM-DD HH:MM" или null,
      "tags": ["список", "тегов"],
      "assignees": ["имя1", "имя2"]  // только для командной задачи, иначе []
+     "assignee_user_ids": ["user_id"] // если удалось сопоставить с профилями
    }
 
    Для "update_personal_task" / "update_team_task":
@@ -163,7 +166,8 @@ SYSTEM_PROMPT_MAIN = Template(
      "description": "описание",
      "start_datetime": "YYYY-MM-DD HH:MM",
      "end_datetime": "YYYY-MM-DD HH:MM",
-     "link_task_id": "id связанной задачи или null"
+     "link_task_id": "id связанной задачи или null",
+     "attendees": ["email1", "email2"]
    }
 
    Для "login":
@@ -330,6 +334,18 @@ def _heuristic_classification(text: str) -> Classification:
     if "календар" in lower or "напом" in lower:
         return Classification(ActionKind.CREATE, Topic.CALENDAR, 0.55)
     return Classification(ActionKind.OTHER, Topic.OTHER, 0.3)
+
+
+def build_profile_context(profile: Dict[str, str] | None) -> str:
+    if not profile:
+        return ""
+    return (
+        "Пользователь: "
+        f"имя = {profile.get('display_name','')}, "
+        f"роль = {profile.get('role','')}, "
+        f"часовой пояс = {profile.get('timezone','')}, "
+        f"e-mail = {profile.get('email','')}"
+    )
 
 
 def analyze_request(text: str, context_data: str | None = None) -> Tuple[Classification, PlannedAction]:

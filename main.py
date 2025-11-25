@@ -10,6 +10,9 @@ from typing import Any, Dict
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 
 import ai_service
@@ -23,9 +26,20 @@ from ai_schemas import PlannedAction
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+
+class RegistrationStates(StatesGroup):
+    display_name = State()
+    email = State()
+    calendar_email = State()
+    timezone = State()
+    notify_calendar = State()
+    notify_telegram = State()
+    role = State()
+
+
 router = Router()
 bot = Bot(CONFIG.telegram_token, parse_mode=ParseMode.HTML)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(router)
 
 
@@ -40,7 +54,9 @@ def _menu_keyboard() -> ReplyKeyboardMarkup:
 
 
 async def _handle_ai(message: Message, text: str) -> None:
-    cls, action = ai_service.analyze_request(text)
+    profile = google_service.get_user_by_telegram_id(message.from_user.id)
+    profile_context = ai_service.build_profile_context(profile) if profile else None
+    cls, action = ai_service.analyze_request(text, context_data=profile_context)
     debug_block = ""
     response: str
     if action.confidence < CONFIG.thresholds.low:
@@ -67,13 +83,63 @@ async def _handle_ai(message: Message, text: str) -> None:
     await message.answer(response + debug_block)
 
 
+def _parse_yes_no(text: str) -> bool | None:
+    lower = text.strip().lower()
+    if lower in {"да", "yes", "y", "true", "1"}:
+        return True
+    if lower in {"нет", "no", "n", "false", "0"}:
+        return False
+    return None
+
+
+async def _start_registration(message: Message, state: FSMContext) -> None:
+    google_service.ensure_structures()
+    await state.clear()
+    await state.set_state(RegistrationStates.display_name)
+    await message.answer("Как к вам обращаться? (Имя или имя + фамилия)")
+
+
+def _profile_summary(profile: Dict[str, str]) -> str:
+    lines = [
+        f"Имя: {profile.get('display_name', '')}",
+        f"Telegram: @{profile.get('telegram_username', '')} ({profile.get('telegram_full_name', '')})",
+        f"E-mail: {profile.get('email', '')}",
+        f"E-mail для календаря: {profile.get('calendar_email', profile.get('email', ''))}",
+        f"Часовой пояс: {profile.get('timezone', '')}",
+        f"Роль: {profile.get('role', '')}",
+        f"Уведомления в календарь: {profile.get('notify_calendar', 'FALSE')}",
+        f"Уведомления в Telegram: {profile.get('notify_telegram', 'FALSE')}",
+    ]
+    return "\n".join(lines)
+
+
+async def _ensure_profile(message: Message, state: FSMContext) -> bool:
+    google_service.ensure_structures()
+    profile = google_service.get_user_by_telegram_id(message.from_user.id)
+    if profile:
+        google_service.update_user_last_seen(profile.get("user_id", ""))
+        return True
+    if await state.get_state():
+        return False
+    await _start_registration(message, state)
+    return False
+
+
 @router.message(Command("start"))
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    profile = google_service.get_user_by_telegram_id(message.from_user.id)
+    if profile:
+        await message.answer(
+            "Вы уже зарегистрированы. Ваш профиль:\n" + _profile_summary(profile),
+            reply_markup=_menu_keyboard(),
+        )
+        return
     await message.answer(
         "Привет! Я AI-секретарь. Умею управлять личными и командными задачами, заметками и календарём."
-        " Установите пароль для шифрования командой /login <пароль>.",
+        " Давайте настроим профиль.",
         reply_markup=_menu_keyboard(),
     )
+    await _start_registration(message, state)
 
 
 @router.message(Command("help"))
@@ -85,6 +151,69 @@ async def cmd_help(message: Message) -> None:
         "- создай задачу для команды по дизайну до пятницы\n"
         "- покажи мои задачи со статусом todo"
     )
+
+
+@router.message(Command("profile"))
+async def cmd_profile(message: Message, state: FSMContext) -> None:
+    profile = google_service.get_user_by_telegram_id(message.from_user.id)
+    if not profile:
+        await _start_registration(message, state)
+        return
+    await message.answer(_profile_summary(profile))
+
+
+@router.message(Command("settings"))
+async def cmd_settings(message: Message, state: FSMContext) -> None:
+    profile = google_service.get_user_by_telegram_id(message.from_user.id)
+    if not profile:
+        await _start_registration(message, state)
+        return
+    await message.answer(
+        _profile_summary(profile)
+        + "\n\nИзменить данные: /set_email <email> [calendar_email]\n"
+        "Установить часовой пояс: /set_timezone <Europe/Moscow>\n"
+        "Уведомления: /set_notify <calendar yes/no> <telegram yes/no>"
+    )
+
+
+@router.message(Command("set_email"))
+async def cmd_set_email(message: Message) -> None:
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Используйте: /set_email <email> [calendar_email]")
+        return
+    updates = {"email": parts[1]}
+    if len(parts) > 2:
+        updates["calendar_email"] = parts[2]
+    google_service.update_user_fields_by_telegram(message.from_user.id, updates)
+    await message.answer("E-mail обновлён")
+
+
+@router.message(Command("set_timezone"))
+async def cmd_set_timezone(message: Message) -> None:
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Используйте: /set_timezone Europe/Moscow")
+        return
+    google_service.update_user_fields_by_telegram(message.from_user.id, {"timezone": parts[1].strip()})
+    await message.answer("Часовой пояс обновлён")
+
+
+@router.message(Command("set_notify"))
+async def cmd_set_notify(message: Message) -> None:
+    parts = (message.text or "").split()
+    if len(parts) < 3:
+        await message.answer("Используйте: /set_notify <calendar yes/no> <telegram yes/no>")
+        return
+    calendar_flag = _parse_yes_no(parts[1])
+    telegram_flag = _parse_yes_no(parts[2])
+    updates = {}
+    if calendar_flag is not None:
+        updates["notify_calendar"] = str(calendar_flag)
+    if telegram_flag is not None:
+        updates["notify_telegram"] = str(telegram_flag)
+    google_service.update_user_fields_by_telegram(message.from_user.id, updates)
+    await message.answer("Уведомления обновлены")
 
 
 @router.message(Command("login"))
@@ -124,20 +253,108 @@ async def cmd_menu(message: Message) -> None:
 
 
 @router.message()
-async def message_handler(message: Message) -> None:
+async def message_handler(message: Message, state: FSMContext) -> None:
+    if not await _ensure_profile(message, state):
+        return
     await _handle_ai(message, message.text or "")
 
 
+@router.message(RegistrationStates.display_name)
+async def reg_display_name(message: Message, state: FSMContext) -> None:
+    await state.update_data(display_name=message.text.strip())
+    await state.set_state(RegistrationStates.email)
+    await message.answer(
+        "Укажите e-mail на Google, куда присылать приглашения в календарь (например, ivanov@gmail.com)."
+    )
+
+
+@router.message(RegistrationStates.email)
+async def reg_email(message: Message, state: FSMContext) -> None:
+    await state.update_data(email=message.text.strip())
+    await state.set_state(RegistrationStates.calendar_email)
+    await message.answer("Если e-mail для календаря отличается, укажите его. Иначе повторите предыдущий адрес.")
+
+
+@router.message(RegistrationStates.calendar_email)
+async def reg_calendar_email(message: Message, state: FSMContext) -> None:
+    await state.update_data(calendar_email=message.text.strip())
+    await state.set_state(RegistrationStates.timezone)
+    await message.answer("Выберите часовой пояс (например, Europe/Moscow или Europe/Berlin)")
+
+
+@router.message(RegistrationStates.timezone)
+async def reg_timezone(message: Message, state: FSMContext) -> None:
+    await state.update_data(timezone=message.text.strip())
+    await state.set_state(RegistrationStates.notify_calendar)
+    await message.answer("Отправлять приглашения в календарь? (да/нет)")
+
+
+@router.message(RegistrationStates.notify_calendar)
+async def reg_notify_calendar(message: Message, state: FSMContext) -> None:
+    flag = _parse_yes_no(message.text)
+    if flag is None:
+        await message.answer("Ответьте да или нет")
+        return
+    await state.update_data(notify_calendar=str(flag))
+    await state.set_state(RegistrationStates.notify_telegram)
+    await message.answer("Присылать личные напоминания в Telegram? (да/нет)")
+
+
+@router.message(RegistrationStates.notify_telegram)
+async def reg_notify_telegram(message: Message, state: FSMContext) -> None:
+    flag = _parse_yes_no(message.text)
+    if flag is None:
+        await message.answer("Ответьте да или нет")
+        return
+    await state.update_data(notify_telegram=str(flag))
+    await state.set_state(RegistrationStates.role)
+    await message.answer("Укажите вашу роль/тип пользователя (например, менеджер, дизайнер) или напишите 'пропустить'")
+
+
+@router.message(RegistrationStates.role)
+async def reg_role(message: Message, state: FSMContext) -> None:
+    role = "" if message.text.strip().lower() == "пропустить" else message.text.strip()
+    data = await state.get_data()
+    profile = {
+        "user_id": str(message.from_user.id),
+        "telegram_user_id": str(message.from_user.id),
+        "telegram_username": message.from_user.username or "",
+        "telegram_full_name": message.from_user.full_name,
+        "display_name": data.get("display_name", message.from_user.full_name),
+        "email": data.get("email", ""),
+        "calendar_email": data.get("calendar_email", data.get("email", "")),
+        "timezone": data.get("timezone", "UTC"),
+        "role": role,
+        "notify_calendar": data.get("notify_calendar", "FALSE"),
+        "notify_telegram": data.get("notify_telegram", "FALSE"),
+        "created_at": datetime.utcnow().isoformat(),
+        "last_seen_at": datetime.utcnow().isoformat(),
+        "is_active": "TRUE",
+    }
+    google_service.create_user(profile)
+    await state.clear()
+    await message.answer(
+        "Профиль создан!\n" + _profile_summary(profile) + "\nИспользуйте /profile или /settings для просмотра и изменения.",
+        reply_markup=_menu_keyboard(),
+    )
+
+
 async def reminder_worker() -> None:
+    google_service.ensure_structures()
     while True:
         await asyncio.sleep(300)
-        for user_id in list(command_service.user_sessions.keys()):
-            tasks = google_service.upcoming_tasks_for_user(user_id)
+        for user in google_service.list_users():
+            if str(user.get("notify_telegram", "")).lower() not in {"true", "1", "yes", "y"}:
+                continue
+            telegram_id = user.get("telegram_user_id")
+            if not telegram_id:
+                continue
+            tasks = google_service.upcoming_tasks_for_user(user.get("user_id", ""))
             if not tasks:
                 continue
             text = ai_service.build_reminder_text(tasks)
             try:
-                await bot.send_message(user_id, text)
+                await bot.send_message(int(telegram_id), text)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to send reminder: %s", exc)
 
