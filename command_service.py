@@ -31,6 +31,7 @@ def _require_password(user_id: int) -> str | None:
 
 def process(classification: Classification, action: PlannedAction, user_id: int) -> Tuple[str, Dict]:
     google_service.ensure_structures()
+    profile = google_service.get_user_by_telegram_id(user_id)
     debug_meta = {
         "kind": classification.kind.value,
         "topic": classification.topic.value,
@@ -83,15 +84,56 @@ def process(classification: Classification, action: PlannedAction, user_id: int)
             if params.get("scope") == "personal":
                 if msg:
                     return msg, debug_meta
-                event_id = google_service.create_or_update_calendar_event(
-                    params.get("title", ""), params.get("description", ""), params.get("due_date", ""), None
-                ) if params.get("add_to_calendar") else None
+                attendee_ids = [profile["user_id"]] if profile else []
+                attendees = google_service.attendee_emails_for_users(attendee_ids) if params.get("add_to_calendar") else []
+                event_id = (
+                    google_service.create_or_update_calendar_event(
+                        params.get("title", ""),
+                        params.get("description", ""),
+                        params.get("due_date", ""),
+                        params.get("due_date", ""),
+                        None,
+                        attendees,
+                        (profile or {}).get("timezone", "UTC"),
+                    )
+                    if params.get("add_to_calendar")
+                    else None
+                )
                 task_id = google_service.add_personal_task(user_id, {**params, "calendar_event_id": event_id})
                 return f"Личная задача создана (id={task_id}).", debug_meta
-            event_id = google_service.create_or_update_calendar_event(
-                params.get("title", ""), params.get("description", ""), params.get("due_date", ""), None
-            ) if params.get("add_to_calendar") else None
-            task_id = google_service.add_team_task({**params, "calendar_event_id": event_id})
+            assignees = params.get("assignees", []) or []
+            if isinstance(assignees, str):
+                assignees_list = [p.strip() for p in assignees.split(",") if p.strip()]
+            else:
+                assignees_list = list(assignees)
+            matched_users = google_service.find_users_by_names(assignees_list)
+            assignee_ids = [u.get("user_id", "") for u in matched_users if u.get("user_id")]
+            attendee_ids = assignee_ids.copy()
+            if profile and profile.get("user_id"):
+                attendee_ids.append(profile["user_id"])
+            attendees = google_service.attendee_emails_for_users(attendee_ids) if params.get("add_to_calendar") else []
+            event_id = (
+                google_service.create_or_update_calendar_event(
+                    params.get("title", ""),
+                    params.get("description", ""),
+                    params.get("due_date", ""),
+                    params.get("due_date", ""),
+                    None,
+                    attendees,
+                    (profile or {}).get("timezone", "UTC"),
+                )
+                if params.get("add_to_calendar")
+                else None
+            )
+            task_id = google_service.add_team_task(
+                {
+                    **params,
+                    "assignee_user_ids": assignee_ids,
+                    "calendar_event_id": event_id,
+                    "owner_user_id": (profile or {}).get("user_id", ""),
+                    "assignees": ",".join(assignees_list),
+                }
+            )
             return f"Командная задача создана (id={task_id}).", debug_meta
         if method == "update_task_status":
             if params.get("scope") == "personal":
@@ -116,7 +158,13 @@ def process(classification: Classification, action: PlannedAction, user_id: int)
             return "\n".join(lines), debug_meta
         if method == "calendar_create_or_update":
             event_id = google_service.create_or_update_calendar_event(
-                params.get("title", ""), params.get("description", ""), params.get("due_date", ""), params.get("calendar_event_id")
+                params.get("title", ""),
+                params.get("description", ""),
+                params.get("due_date", ""),
+                params.get("due_date", ""),
+                params.get("calendar_event_id"),
+                [],
+                (profile or {}).get("timezone", "UTC"),
             )
             return "Событие календаря обновлено." if event_id else "Не удалось обновить календарь.", debug_meta
         if method == "clarify":
