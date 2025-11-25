@@ -1,4 +1,10 @@
-"""Configuration utilities for environment-driven settings."""
+"""Configuration utilities for environment-driven settings.
+
+The module centralises all environment-driven settings and threshold values
+to keep the rest of the code declarative. Paths are resolved relative to the
+project root to make the bot resilient for auto-start scenarios where the
+working directory may differ.
+"""
 from __future__ import annotations
 
 import os
@@ -13,14 +19,6 @@ load_dotenv()
 
 
 @dataclass(frozen=True)
-class Thresholds:
-    """Confidence thresholds for AI decisions."""
-
-    high: float = 0.75
-    low: float = 0.4
-
-
-@dataclass(frozen=True)
 class Config:
     """Global configuration loaded from environment variables."""
 
@@ -31,7 +29,9 @@ class Config:
     google_credentials_file: Optional[Path]
     dialog_log_path: Path
     ai_model: str
-    thresholds: Thresholds = Thresholds()
+    ai_high_confidence: float = 0.75
+    ai_low_confidence: float = 0.40
+    reminder_interval_seconds: int = 300
 
     @staticmethod
     def load() -> "Config":
@@ -43,8 +43,10 @@ class Config:
             raise RuntimeError("GOOGLE_SHEETS_ID is required in environment")
         calendar_id = os.getenv("GOOGLE_CALENDAR_ID")
         creds_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        log_path = Path(os.getenv("DIALOG_LOG_PATH", "dialog_log.jsonl")).resolve()
+        project_root = Path(__file__).resolve().parent
+        log_path = Path(os.getenv("DIALOG_LOG_PATH", project_root / "dialog_log.jsonl")).resolve()
         ai_model = os.getenv("GENAI_MODEL", "gemini-3-pro-preview")
+        reminder_interval = int(os.getenv("REMINDER_INTERVAL_SECONDS", "300"))
         return Config(
             telegram_token=token,
             google_project_id=os.getenv("GOOGLE_PROJECT_ID"),
@@ -53,6 +55,7 @@ class Config:
             google_credentials_file=Path(creds_file) if creds_file else None,
             dialog_log_path=log_path,
             ai_model=ai_model,
+            reminder_interval_seconds=reminder_interval,
         )
 
 
