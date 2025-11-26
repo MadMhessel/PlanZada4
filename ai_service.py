@@ -25,32 +25,29 @@ async def _call_model(
     *,
     temperature: float = 0.2,
     max_output_tokens: int = 512,
+    extra_config: dict | None = None,
 ) -> Optional[str]:
     """Безопасный вызов модели Gemini с обработкой всех вариантов ответа."""
 
     def _sync_call() -> Optional[str]:
-        try:
-            model = genai.GenerativeModel(CONFIG.ai_model)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Ошибка инициализации модели: %s", exc)
-            return None
-
+        model = genai.GenerativeModel(CONFIG.AI_MODEL)
         try:
             response = model.generate_content(
                 prompt,
                 generation_config={
                     "temperature": temperature,
                     "max_output_tokens": max_output_tokens,
+                    **(extra_config or {}),
                 },
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Ошибка вызова модели: %s", exc)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Ошибка вызова модели: %s", e)
             return None
 
         try:
             return response.text  # может бросить ValueError
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Модель не вернула .text, пробуем разобрать кандидатов: %s", exc)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Модель не вернула .text, пробуем кандидатов: %s", e)
 
         try:
             candidates = getattr(response, "candidates", None) or []
@@ -60,9 +57,12 @@ async def _call_model(
 
             cand0 = candidates[0]
             finish_reason = getattr(cand0, "finish_reason", None)
-            if finish_reason not in (1, "STOP", None):
+
+            bad_reasons = {"SAFETY", "BLOCKED", "OTHER", "RECITATION"}
+            bad_codes = {3, 4}
+            if finish_reason in bad_reasons or finish_reason in bad_codes:
                 logger.warning(
-                    "Модель завершила генерацию с finish_reason=%r, текст не используем",
+                    "Модель завершилась с проблемной finish_reason=%r, текст не используем",
                     finish_reason,
                 )
                 return None
@@ -72,10 +72,10 @@ async def _call_model(
 
             texts: list[str] = []
             if parts:
-                for part in parts:
-                    text_part = getattr(part, "text", None)
-                    if text_part:
-                        texts.append(text_part)
+                for p in parts:
+                    t = getattr(p, "text", None)
+                    if t:
+                        texts.append(t)
 
             if not texts:
                 logger.warning("Кандидат без текстовых частей, cand0=%r", cand0)
@@ -93,6 +93,7 @@ def _safe_json_loads(text: str) -> Optional[dict]:
     try:
         return json.loads(text)
     except Exception:  # noqa: BLE001
+        logger.debug("Failed to parse JSON from model output: %r", text, exc_info=True)
         return None
 
 
@@ -106,15 +107,24 @@ def _coerce_confidence(value: Any, default: float = 0.5) -> float:
 
 def build_context_for_user(profile: dict) -> str:
     """Compose context text from profile, dialog history and recent actions."""
-    history = get_recent_history(int(profile.get("telegram_user_id", 0)), limit=8)
-    actions_summary = get_recent_actions_summary(int(profile.get("telegram_user_id", 0)), limit=5)
 
-    profile_lines = [
-        "Профиль пользователя:",
-        f"- Имя: {profile.get('display_name', '')}",
-        f"- Часовой пояс: {profile.get('timezone', 'UTC')}",
-        f"- Email для календаря: {profile.get('email', '')}",
-    ]
+    user_id = 0
+    try:
+        user_id = int(profile.get("telegram_user_id", 0))
+    except (TypeError, ValueError):
+        logger.debug("Invalid telegram_user_id in profile: %r", profile.get("telegram_user_id"))
+
+    history = get_recent_history(user_id, limit=8)
+    actions_summary = get_recent_actions_summary(user_id, limit=5)
+
+    display_name = (
+        profile.get("display_name")
+        or profile.get("telegram_full_name")
+        or profile.get("telegram_username")
+        or "Пользователь"
+    )
+    timezone = profile.get("timezone") or "UTC"
+    email = profile.get("calendar_email") or profile.get("email") or "не указан"
 
     history_lines = ["Краткая история последних сообщений:"]
     if history:
@@ -127,21 +137,31 @@ def build_context_for_user(profile: dict) -> str:
     actions_lines = ["Краткое резюме последних действий ассистента:"]
     actions_lines.append(actions_summary or "(Нет зафиксированных действий)")
 
-    return "\n".join(profile_lines + ["", *history_lines, "", *actions_lines])
+    context = (
+        "Профиль пользователя:\n"
+        f"- Имя: {display_name}\n"
+        f"- Часовой пояс: {timezone}\n"
+        f"- Email для календаря: {email}\n\n"
+        + "\n".join(history_lines)
+        + "\n\n"
+        + "\n".join(actions_lines)
+    )
+    return context
 
 
 async def analyze_intent(profile: dict, user_text: str, context_text: str) -> dict:
-    """Quickly determine topic, intent and rough method."""
+    """Определяет тему и намерение запроса."""
+
     prompt = (
-        "Ты — системный классификатор намерений. Цель: определить тему и намерение запроса пользователя.\n"
-        "Используй CONTEXT для разрешения местоимений вроде 'эта задача', ссылайся на последние действия.\n"
-        "Верни строго JSON с полями: {"
-        "\"topic\": \"PERSONAL_TASK|TEAM_TASK|PERSONAL_NOTE|CALENDAR|CHAT|OTHER\"," \
-        "\"intent\": \"CREATE|READ|UPDATE|DELETE|OTHER\", "
-        "\"rough_method\": \"string\", \"complexity\": \"simple|medium|complex\", \"confidence\": 0..1 }.\n"
-        f"CONTEXT:\n{context_text}\n"
-        f"USER_TEXT:\n{user_text}\n"
-        "Отвечай только JSON без пояснений."
+        "Ты — системный классификатор намерений. Твоя задача: определить тему и намерение запроса пользователя.\n"
+        "Верни JSON строго в формате: {"
+        "\"topic\": \"PERSONAL_TASK|TEAM_TASK|PERSONAL_NOTE|CALENDAR|CHAT|OTHER\","
+        " \"intent\": \"CREATE|READ|UPDATE|DELETE|OTHER\","
+        " \"rough_method\": \"string\", \"complexity\": \"simple|medium|complex\", \"confidence\": 0..1 }.\n"
+        "Никаких пояснений и текста кроме JSON.\n"
+        "Используй контекст и историю для понимания местоимений.\n"
+        f"=== КОНТЕКСТ ===\n{context_text}\n"
+        f"=== ЗАПРОС ===\n{user_text}\n"
     )
     raw = await _call_model(prompt, temperature=0.1, max_output_tokens=300)
     parsed = _safe_json_loads(raw or "")
@@ -163,28 +183,31 @@ async def analyze_intent(profile: dict, user_text: str, context_text: str) -> di
 
 
 async def extract_structure(profile: dict, user_text: str, context_text: str, intent: dict) -> dict:
-    """Extract structured fields depending on topic."""
+    """Извлекает структурированные данные в зависимости от темы."""
+
     prompt = (
         "Ты извлекаешь структурированные поля из запроса пользователя.\n"
-        "Для PERSONAL_TASK или TEAM_TASK нужны поля: title, description, due_datetime_local (ISO), priority (low|medium|high), "
-        "tags (list of strings), assignees (list).\n"
-        "Для CALENDAR: summary, start_datetime_local, end_datetime_local, all_day (bool).\n"
-        "Для PERSONAL_NOTE: title, body.\n"
-        "Используй CONTEXT, чтобы понять ссылки на предыдущие задачи/события и местоимения.\n"
-        "Верни JSON только с актуальными для topic полями. Пропущенные поля делай null.\n"
-        f"CONTEXT:\n{context_text}\n"
-        f"INTENT (текстом): {json.dumps(intent, ensure_ascii=False)}\n"
-        f"USER_TEXT:\n{user_text}\n"
+        "Ответь строго JSON. Для разных topic поля такие:\n"
+        "- PERSONAL_TASK/TEAM_TASK: title, description, due_datetime_local (ISO с учетом часового пояса пользователя),"
+        " priority (low|medium|high), tags (list[str]), assignees (list[str]) для командных задач.\n"
+        "- CALENDAR: summary, start_datetime_local, end_datetime_local, all_day (bool).\n"
+        "- PERSONAL_NOTE: title (может быть пустым), body.\n"
+        "Заполняй только актуальные для topic поля, остальные делай null или пустыми.\n"
+        "Используй CONTEXT для разрешения местоимений и ссылок на предыдущие действия.\n"
+        f"=== КОНТЕКСТ ===\n{context_text}\n"
+        f"INTENT (JSON): {json.dumps(intent, ensure_ascii=False)}\n"
+        f"=== ЗАПРОС ===\n{user_text}\n"
     )
     raw = await _call_model(prompt, temperature=0.2, max_output_tokens=400)
     parsed = _safe_json_loads(raw or "") or {}
+
     result: Dict[str, Any] = {
         "title": parsed.get("title"),
         "description": parsed.get("description"),
         "due_datetime_local": parsed.get("due_datetime_local"),
         "priority": parsed.get("priority"),
-        "tags": parsed.get("tags"),
-        "assignees": parsed.get("assignees"),
+        "tags": parsed.get("tags") if isinstance(parsed.get("tags"), list) else parsed.get("tags"),
+        "assignees": parsed.get("assignees") if isinstance(parsed.get("assignees"), list) else parsed.get("assignees"),
         "summary": parsed.get("summary"),
         "start_datetime_local": parsed.get("start_datetime_local"),
         "end_datetime_local": parsed.get("end_datetime_local"),
@@ -201,96 +224,112 @@ async def make_plan(
     intent: dict,
     structured: dict,
 ) -> dict:
-    """Convert intent + structured data into executable plan."""
-    allowed_methods = {
+    """Преобразует intent и структуру в исполняемый план."""
+
+    allowed_methods = [
         "create_personal_task",
         "update_personal_task",
         "list_personal_tasks",
         "create_team_task",
+        "update_team_task",
+        "list_team_tasks",
         "create_or_update_calendar_event",
         "write_personal_note",
-        "update_personal_note",
-        "delete_personal_note",
-        "list_team_tasks",
+        "search_personal_notes",
         "chat",
         "clarify",
-    }
-    methods_description = (
-        "create_personal_task: новая личная задача; "
-        "update_personal_task: изменить личную задачу по id; "
-        "list_personal_tasks: показать список личных задач; "
-        "create_team_task: новая командная задача; "
-        "create_or_update_calendar_event: создать/обновить событие календаря; "
-        "write_personal_note/update_personal_note/delete_personal_note: операции с заметками; "
-        "list_team_tasks: показать командные задачи; "
-        "chat: когда запрос не о задачах/календаре; "
-        "clarify: задать уточняющий вопрос."
-    )
+        "show_help",
+    ]
+
     prompt = (
-        "Ты планировщик действий. На основе intent и извлечённой структуры выбери метод программы и параметры.\n"
-        f"Доступные методы: {methods_description}\n"
-        "Если запрос не про задачи/календарь/заметки — выбирай method='chat'.\n"
-        "Формат JSON ответа: {\"method\": string, \"params\": {...}, \"user_visible_answer\": string, \"confidence\": 0..1, \"clarify_question\": null|string}.\n"
-        "Используй CONTEXT для разрешения местоимений и последних действий.\n"
-        f"CONTEXT:\n{context_text}\n"
+        "Ты планировщик действий. На основе intent и извлечённых данных выбери метод и параметры.\n"
+        "Доступные методы: create_personal_task, update_personal_task, list_personal_tasks, create_team_task,"
+        " update_team_task, list_team_tasks, create_or_update_calendar_event, write_personal_note, search_personal_notes,"
+        " chat, clarify, show_help.\n"
+        "Если это просто разговор — method='chat'. Если данных недостаточно — method='clarify' и задай clarify_question.\n"
+        "Формат JSON ответа: {\"method\": string, \"params\": {...}, \"user_visible_answer\": string,"
+        " \"confidence\": 0..1, \"clarify_question\": null|string}.\n"
+        f"=== КОНТЕКСТ ===\n{context_text}\n"
         f"INTENT:\n{json.dumps(intent, ensure_ascii=False)}\n"
         f"STRUCTURED:\n{json.dumps(structured, ensure_ascii=False)}\n"
-        f"USER_TEXT:\n{user_text}\n"
+        f"=== ЗАПРОС ===\n{user_text}\n"
         "Отвечай только JSON."
     )
     raw = await _call_model(prompt, temperature=0.15, max_output_tokens=500)
     parsed = _safe_json_loads(raw or "") or {}
-    method = parsed.get("method")
-    if method not in allowed_methods:
-        method = "chat"
+
+    method = parsed.get("method") if parsed.get("method") in allowed_methods else "chat"
     plan = {
         "method": method,
         "params": parsed.get("params") or {},
-        "user_visible_answer": parsed.get("user_visible_answer") or "",
+        "user_visible_answer": parsed.get("user_visible_answer") or None,
         "confidence": _coerce_confidence(parsed.get("confidence"), 0.5 if method == "chat" else 0.7),
         "clarify_question": parsed.get("clarify_question"),
     }
+    if method == "clarify" and not plan["clarify_question"]:
+        plan["clarify_question"] = "Мне нужно уточнить детали, чтобы продолжить."
     return plan
 
 
 async def review_plan(profile: dict, user_text: str, context_text: str, plan: dict) -> dict:
-    """Review plan for obvious issues and missing data."""
+    """Оценивает качество плана и необходимость уточнений."""
+
     prompt = (
-        "Ты ревизор плана. Проверь, хватает ли данных в plan.params для безопасного выполнения.\n"
-        "Особенно оцени даты/время, понятность задачи/события и соответствие intent выбранному методу.\n"
+        "Ты ревизор плана. Проверь, хватает ли данных в plan.params для безопасного выполнения."
+        " Оцени дату/время, полноту описания и соответствие intent выбранному методу.\n"
         "Верни JSON {\"quality\":0..1, \"problems\":[...], \"clarify_question\": null|string}.\n"
-        "Используй CONTEXT (история и последние действия) для понимания местоимений.\n"
-        f"CONTEXT:\n{context_text}\n"
+        "Если есть сомнения — предлагай уточнить.\n"
+        f"=== КОНТЕКСТ ===\n{context_text}\n"
         f"PLAN:\n{json.dumps(plan, ensure_ascii=False)}\n"
-        f"USER_TEXT:\n{user_text}\n"
+        f"=== ЗАПРОС ===\n{user_text}\n"
         "Отвечай только JSON."
     )
     raw = await _call_model(prompt, temperature=0.1, max_output_tokens=300)
     parsed = _safe_json_loads(raw or "")
     if not parsed:
         return {
-            "quality": 0.4,
-            "problems": ["Модель вернула некорректный формат."],
-            "clarify_question": "Я не уверен, что правильно понял ваш запрос. Пожалуйста, уточните детали.",
+            "quality": 0.5,
+            "problems": [],
+            "clarify_question": None,
         }
     return {
         "quality": _coerce_confidence(parsed.get("quality"), 0.5),
-        "problems": parsed.get("problems", []),
+        "problems": parsed.get("problems") or [],
         "clarify_question": parsed.get("clarify_question"),
     }
 
 
+async def free_chat(
+    profile: dict,
+    question: str | None = None,
+    context_text: str | None = None,
+    **kwargs: Any,
+) -> str:
+    """Свободный диалог с учётом контекста и безопасным фолбэком."""
+
+    resolved_question = question or "Продолжай диалог со мной."
+    resolved_context = context_text or build_context_for_user(profile)
+    prompt = (
+        "Ты — дружелюбный ассистент. Отвечай кратко и по делу на русском языке.\n"
+        f"Контекст по пользователю:\n{resolved_context}\n"
+        f"Вопрос или реплика: {resolved_question}\n"
+    )
+    text = await _call_model(prompt, temperature=0.3, max_output_tokens=500, extra_config=kwargs.get("extra_config"))
+    return text or "Сейчас я не могу получить ответ от модели, но продолжу помогать вам по мере возможностей."
+
+
 async def process_user_request(profile: dict, user_text: str) -> dict:
-    """Orchestrate all AI stages and return final plan."""
+    """Оркеструет все этапы AI и возвращает итоговый план."""
+
     context_text = build_context_for_user(profile)
     intent = await analyze_intent(profile, user_text, context_text)
 
     if intent.get("topic") == "CHAT":
-        chat_answer = await free_chat(profile, user_text, context_text)
+        reply = await free_chat(profile, question=user_text, context_text=context_text)
         return {
             "method": "chat",
-            "params": {},
-            "user_visible_answer": chat_answer,
+            "params": {"question": user_text, "context_text": context_text},
+            "user_visible_answer": reply,
             "confidence": 1.0,
             "clarify_question": None,
         }
@@ -307,12 +346,12 @@ async def process_user_request(profile: dict, user_text: str) -> dict:
             "method": "clarify",
             "params": {},
             "user_visible_answer": clarify_question
-            or "Я не уверен, что правильно понял ваш запрос. Пожалуйста, уточните детали.",
+            or "Я не уверен, что правильно понял запрос. Уточните, пожалуйста.",
             "confidence": quality,
             "clarify_question": clarify_question,
         }
 
-    if quality < 0.8 and clarify_question:
+    if 0.5 <= quality < 0.8 and clarify_question:
         return {
             "method": "clarify",
             "params": {},
@@ -322,18 +361,6 @@ async def process_user_request(profile: dict, user_text: str) -> dict:
         }
 
     return plan
-
-
-async def free_chat(profile: dict, question: str, context_text: str | None = None) -> str:
-    """Fallback chat-style response with context awareness."""
-    resolved_context = context_text or build_context_for_user(profile)
-    prompt = (
-        "Ты — дружелюбный ассистент. Отвечай кратко и по делу на русском.\n"
-        f"Контекст по пользователю:\n{resolved_context}\n"
-        f"Вопрос: {question}"
-    )
-    text = await _call_model(prompt, temperature=0.3, max_output_tokens=500)
-    return text or "Готово."
 
 
 async def build_reminder_text(tasks: list[dict], user: dict) -> str:
@@ -375,7 +402,7 @@ async def build_reminder_text(tasks: list[dict], user: dict) -> str:
 
     for idx, task in enumerate(tasks, start=1):
         title = task.get("title") or task.get("name") or "Задача без названия"
-        due = task.get("due") or task.get("due_datetime_local") or ""
+        due = task.get("due") or task.get("due_datetime_local") or task.get("due_datetime") or ""
         if due:
             lines.append(f"{idx}) {title} — срок: {due}")
         else:
@@ -393,7 +420,7 @@ def _format_tasks_for_prompt(tasks: list[dict]) -> str:
     lines: list[str] = []
     for idx, task in enumerate(tasks[:10], start=1):
         title = task.get("title") or task.get("name") or "Задача без названия"
-        due = task.get("due") or task.get("due_datetime_local") or "срок не указан"
+        due = task.get("due") or task.get("due_datetime_local") or task.get("due_datetime") or "срок не указан"
         status = task.get("status") or "open"
         lines.append(f"{idx}) [{status}] {title} (срок: {due})")
 

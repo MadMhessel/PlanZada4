@@ -33,6 +33,12 @@ class Config:
     ai_low_confidence: float = 0.40
     reminder_interval_seconds: int = 300
 
+    @property
+    def AI_MODEL(self) -> str:
+        """Совместимое имя модели для вызова ИИ (верхний регистр для удобства)."""
+
+        return self.ai_model
+
     @staticmethod
     def load() -> "Config":
         token = os.getenv("TELEGRAM_TOKEN")
