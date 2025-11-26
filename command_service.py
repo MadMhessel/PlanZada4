@@ -9,6 +9,7 @@ from typing import Callable, Dict, Optional
 import ai_service
 import debug_service
 import google_service
+from action_log import log_action
 from config import CONFIG
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,26 @@ METHOD_MAP: Dict[str, Callable] = {
 }
 
 
+def _log_action_safe(profile: dict, method: str, params: dict) -> None:
+    action_type_map = {
+        "create_personal_task": "TASK_CREATED",
+        "update_personal_task": "TASK_UPDATED",
+        "create_team_task": "TASK_CREATED",
+        "update_team_task": "TASK_UPDATED",
+        "create_or_update_calendar_event": "CALENDAR_EVENT_CREATED",
+        "write_personal_note": "NOTE_CREATED",
+        "update_personal_note": "NOTE_UPDATED",
+        "delete_personal_note": "NOTE_DELETED",
+    }
+    action_type = action_type_map.get(method)
+    if not action_type:
+        return
+    try:
+        log_action(int(profile.get("telegram_user_id", 0)), action_type, params)
+    except Exception:  # noqa: BLE001
+        logger.debug("Failed to log action", exc_info=True)
+
+
 async def execute_plan(profile: dict, plan: dict) -> CommandResult:
     """Execute plan returned by AI with threshold handling and safety."""
     try:
@@ -56,6 +77,10 @@ async def execute_plan(profile: dict, plan: dict) -> CommandResult:
     except Exception:  # noqa: BLE001
         logger.exception("Invalid plan structure: %s", plan)
         return CommandResult(user_visible_answer="Не удалось обработать запрос. Попробуйте ещё раз.")
+
+    if method == "clarify":
+        question = plan.get("user_visible_answer") or clarify_question or "Нужны уточнения, чтобы продолжить."
+        return CommandResult(user_visible_answer=str(question))
 
     if clarify_question:
         return CommandResult(user_visible_answer=str(clarify_question))
@@ -74,13 +99,17 @@ async def execute_plan(profile: dict, plan: dict) -> CommandResult:
             else:
                 result = await _run_sync(handler, profile, **params)
             command_result = result if isinstance(result, CommandResult) else CommandResult(user_visible_answer=str(result))
+            _log_action_safe(profile, method, params)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Command failed: %s", exc)
             return CommandResult(
                 user_visible_answer="Во время обработки запроса произошла ошибка. Я записал её в лог и попробую продолжить работу.",
             )
     else:
-        chat_answer = await ai_service.free_chat(profile, question=plan.get("user_visible_answer") or params.get("question", ""))
+        context_text = ai_service.build_context_for_user(profile)
+        chat_answer = await ai_service.free_chat(
+            profile, question=plan.get("user_visible_answer") or params.get("question", ""), context_text=context_text
+        )
         command_result = CommandResult(user_visible_answer=chat_answer)
 
     if debug_service.is_debug_enabled(int(profile.get("telegram_user_id", 0))):
