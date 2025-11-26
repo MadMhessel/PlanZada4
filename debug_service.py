@@ -14,21 +14,33 @@ def is_debug_enabled(user_id: int) -> bool:
 
 
 def debug_on(profile: dict, **_: object) -> str:
-    user_id = int(profile.get("telegram_user_id"))
+    try:
+        user_id = int(profile.get("telegram_user_id"))
+    except (TypeError, ValueError):
+        logger.warning("Invalid telegram_user_id for debug_on: %r", profile.get("telegram_user_id"))
+        return "Не удалось включить debug режим: некорректный идентификатор пользователя."
     _user_debug_flags[user_id] = True
     logger.info("Debug enabled for user %s", user_id)
     return "Debug режим включен."
 
 
 def debug_off(profile: dict, **_: object) -> str:
-    user_id = int(profile.get("telegram_user_id"))
+    try:
+        user_id = int(profile.get("telegram_user_id"))
+    except (TypeError, ValueError):
+        logger.warning("Invalid telegram_user_id for debug_off: %r", profile.get("telegram_user_id"))
+        return "Не удалось выключить debug режим: некорректный идентификатор пользователя."
     _user_debug_flags[user_id] = False
     logger.info("Debug disabled for user %s", user_id)
     return "Debug режим выключен."
 
 
 def debug_status(profile: dict, **_: object) -> str:
-    user_id = int(profile.get("telegram_user_id"))
+    try:
+        user_id = int(profile.get("telegram_user_id"))
+    except (TypeError, ValueError):
+        logger.warning("Invalid telegram_user_id for debug_status: %r", profile.get("telegram_user_id"))
+        return "Не удалось определить статус debug режима."
     return f"Debug режим {'включен' if is_debug_enabled(user_id) else 'выключен'}."
 
 

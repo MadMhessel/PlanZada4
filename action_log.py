@@ -10,8 +10,12 @@ _ACTIONS: Dict[int, Deque[dict]] = defaultdict(lambda: deque(maxlen=50))
 
 def log_action(user_id: int, action_type: str, payload: dict) -> None:
     """Append an action entry for a user."""
+    try:
+        safe_user_id = int(user_id)
+    except (TypeError, ValueError):
+        return
     timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-    _ACTIONS[user_id].append({"timestamp": timestamp, "action_type": action_type, "payload": payload})
+    _ACTIONS[safe_user_id].append({"timestamp": timestamp, "action_type": action_type, "payload": payload})
 
 
 def get_recent_actions_summary(user_id: int, limit: int = 5) -> str:

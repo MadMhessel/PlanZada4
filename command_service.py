@@ -73,7 +73,13 @@ def _log_action_safe(profile: dict, method: str, params: dict) -> None:
     if not action_type:
         return
     try:
-        log_action(int(profile.get("telegram_user_id", 0)), action_type, params)
+        user_id_raw = profile.get("telegram_user_id", 0)
+        try:
+            user_id = int(user_id_raw)
+        except (TypeError, ValueError):
+            logger.debug("Invalid telegram_user_id for logging: %r", user_id_raw)
+            return
+        log_action(user_id, action_type, params)
     except Exception:  # noqa: BLE001
         logger.debug("Failed to log action", exc_info=True)
 
@@ -89,6 +95,16 @@ async def execute_plan(profile: dict, plan: dict) -> CommandResult:
     except Exception:  # noqa: BLE001
         logger.exception("Invalid plan structure: %s", plan)
         return CommandResult(user_visible_answer="Не удалось обработать запрос. Попробуйте ещё раз.")
+
+    if not method:
+        method = "chat"
+        params.setdefault(
+            "question",
+            plan.get("original_question")
+            or params.get("question")
+            or plan.get("user_visible_answer")
+            or "",
+        )
 
     if method == "clarify" or clarify_question:
         question_text = clarify_question or plan.get("user_visible_answer")
@@ -117,7 +133,12 @@ async def execute_plan(profile: dict, plan: dict) -> CommandResult:
             extra_data={"plan": plan},
         )
 
-    if debug_service.is_debug_enabled(int(profile.get("telegram_user_id", 0))):
+    try:
+        debug_user_id = int(profile.get("telegram_user_id", 0))
+    except (TypeError, ValueError):
+        debug_user_id = None
+
+    if debug_user_id is not None and debug_service.is_debug_enabled(debug_user_id):
         debug_info = (
             f"\n\n[debug] method={method}; confidence={confidence:.2f}; params_keys={list(params.keys())}"
         )
