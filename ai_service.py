@@ -58,7 +58,7 @@ async def _call_model(
             logger.debug("Модель не вернула .text, пробуем кандидатов: %s", e)
 
         try:
-            candidates = getattr(response, "candidates", None) or []
+            candidates = list(getattr(response, "candidates", None) or [])
             if not candidates:
                 logger.warning("Модель вернула пустой список candidates")
                 return None
@@ -68,11 +68,14 @@ async def _call_model(
 
             bad_reasons = {"SAFETY", "BLOCKED", "OTHER", "RECITATION"}
             bad_codes = {3, 4}
+
+            warning_logged = False
             if finish_reason in bad_reasons or finish_reason in bad_codes:
                 logger.warning(
                     "Модель завершилась с проблемной finish_reason=%r, текст не используем",
                     finish_reason,
                 )
+                warning_logged = True
                 return None
 
             content = getattr(cand0, "content", None)
@@ -89,11 +92,11 @@ async def _call_model(
                 logger.warning("finish_reason=MAX_TOKENS без текстовых частей")
                 return None
 
-            if finish_reason in {"SAFETY", "BLOCKED", "RECITATION", "OTHER", None}:
-                logger.warning("Проблемная finish_reason=%r", finish_reason)
-
             if not texts:
-                logger.debug("Кандидат без текстовых частей, cand0=%r", cand0)
+                if not warning_logged and finish_reason:
+                    logger.warning("Кандидат без текста, finish_reason=%r", finish_reason)
+                else:
+                    logger.debug("Кандидат без текстовых частей, cand0=%r", cand0)
                 return None
 
             return "\n".join(texts)
@@ -115,10 +118,14 @@ async def _call_model(
         if retry_without_context:
             user_request = _extract_user_request(prompt)
             simple_prompt = (
-                "Ответь на следующий запрос пользователя на русском языке, кратко:\n\n"
+                "Ответь по-русски на следующий запрос кратко и по делу:\n\n"
                 f"{user_request}"
             )
-            return await asyncio.to_thread(_sync_call, truncate_text(simple_prompt, 4000), 200)
+            return await asyncio.to_thread(
+                _sync_call,
+                truncate_text(simple_prompt, 4000),
+                200,
+            )
     except Exception:  # noqa: BLE001
         logger.exception("Ошибка при вызове модели")
     return None
@@ -259,13 +266,16 @@ async def extract_structure(profile: dict, user_text: str, context_text: str, in
         logger.warning("extract_structure failed, using defaults", exc_info=True)
         parsed = {}
 
+    tags = parsed.get("tags") if isinstance(parsed.get("tags"), list) else None
+    assignees = parsed.get("assignees") if isinstance(parsed.get("assignees"), list) else None
+
     result: Dict[str, Any] = {
         "title": parsed.get("title"),
         "description": parsed.get("description"),
         "due_datetime_local": parsed.get("due_datetime_local"),
         "priority": parsed.get("priority"),
-        "tags": parsed.get("tags") if isinstance(parsed.get("tags"), list) else parsed.get("tags"),
-        "assignees": parsed.get("assignees") if isinstance(parsed.get("assignees"), list) else parsed.get("assignees"),
+        "tags": tags,
+        "assignees": assignees,
         "summary": parsed.get("summary"),
         "start_datetime_local": parsed.get("start_datetime_local"),
         "end_datetime_local": parsed.get("end_datetime_local"),
@@ -313,8 +323,19 @@ async def make_plan(
         f"=== ЗАПРОС ===\n{user_text}\n"
         "Отвечай только JSON."
     )
+    fallback_plan = {
+        "method": "chat",
+        "params": {"question": user_text},
+        "user_visible_answer": None,
+        "confidence": 0.5,
+        "clarify_question": None,
+    }
+
     raw = await _call_model(prompt, temperature=0.15, max_output_tokens=512)
     parsed = _safe_json_loads(raw or "") or {}
+
+    if not raw or not parsed:
+        return fallback_plan
 
     method = parsed.get("method") if parsed.get("method") in allowed_methods else "chat"
     plan = {
@@ -328,15 +349,6 @@ async def make_plan(
         plan["params"]["question"] = user_text
     if method == "clarify" and not plan["clarify_question"]:
         plan["clarify_question"] = "Мне нужно уточнить детали, чтобы продолжить."
-
-    if not raw:
-        return {
-            "method": "chat",
-            "params": {"question": user_text},
-            "user_visible_answer": None,
-            "confidence": 0.5,
-            "clarify_question": None,
-        }
 
     return plan
 
@@ -380,8 +392,8 @@ async def free_chat(
     resolved_question = question or "Продолжай диалог со мной."
     resolved_context = truncate_text(context_text or build_context_for_user(profile), 2500)
     prompt = (
-        "Ты — дружелюбный ассистент. Отвечай кратко и по делу на русском языке."
-        " Используй контекст только если он необходим.\n"
+        "Ты — дружелюбный ассистент. Отвечай кратко и по делу на русском языке. "
+        "Используй контекст только если он действительно нужен.\n"
         f"Контекст:\n{resolved_context}\n"
         f"Запрос: {resolved_question}\n"
     )
