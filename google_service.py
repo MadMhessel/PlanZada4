@@ -469,6 +469,7 @@ def _write_sheet_without_headers(sheet: str, rows: List[List[str]]) -> None:
 
 def create_personal_task(profile: dict, **params) -> str:
     try:
+        ensure_structures()
         task_id = str(uuid.uuid4())
         row = [
             task_id,
@@ -498,6 +499,7 @@ def create_personal_task(profile: dict, **params) -> str:
 
 
 def update_personal_task(profile: dict, task_id: str, fields: Dict[str, str], **_: str) -> str:
+    ensure_structures()
     rows = _read_values(PERSONAL_TASKS_SHEET)
     for idx, row in enumerate(rows, start=2):
         if row and row[0] == task_id and row[1] == str(profile.get("user_id")):
@@ -515,6 +517,7 @@ def update_personal_task(profile: dict, task_id: str, fields: Dict[str, str], **
 
 
 def list_personal_tasks(profile: dict, status: Optional[str] = None, **_: str) -> str:
+    ensure_structures()
     rows = _read_values(PERSONAL_TASKS_SHEET)
     tasks = []
     for r in rows:
@@ -531,6 +534,7 @@ def list_personal_tasks(profile: dict, status: Optional[str] = None, **_: str) -
 
 def create_team_task(profile: dict, **params) -> str:
     try:
+        ensure_structures()
         task_id = str(uuid.uuid4())
         assignees = params.get("assignees", []) or []
         if isinstance(assignees, str):
@@ -565,6 +569,7 @@ def create_team_task(profile: dict, **params) -> str:
 
 
 def update_team_task(profile: dict, task_id: str, fields: Dict[str, str], **_: str) -> str:
+    ensure_structures()
     rows = _read_values(TEAM_TASKS_SHEET)
     for idx, row in enumerate(rows, start=2):
         if row and row[0] == task_id:
@@ -582,6 +587,7 @@ def update_team_task(profile: dict, task_id: str, fields: Dict[str, str], **_: s
 
 
 def list_team_tasks(profile: dict, status: Optional[str] = None, **_: str) -> str:
+    ensure_structures()
     rows = _read_values(TEAM_TASKS_SHEET)
     tasks = []
     for r in rows:
