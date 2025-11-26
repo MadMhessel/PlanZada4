@@ -20,6 +20,42 @@ if api_key:
     genai.configure(api_key=api_key)
 
 
+def _normalize_finish_reason(value: Any) -> str:
+    """Приводит finish_reason к строке для удобства сравнения и логирования."""
+
+    if value is None:
+        return "NONE"
+
+    try:
+        if hasattr(value, "name"):
+            value = value.name
+    except Exception:  # noqa: BLE001
+        return "OTHER"
+
+    if isinstance(value, int):
+        value = {
+            0: "OTHER",
+            1: "STOP",
+            2: "MAX_TOKENS",
+            3: "SAFETY",
+            4: "RECITATION",
+        }.get(value, str(value))
+
+    if isinstance(value, str):
+        normalized = value.upper()
+        normalized = normalized.replace("FINISH_REASON_", "")
+        aliases = {
+            "BLOCKED": "BLOCKLIST",
+            "BLOCKLIST_BLOCK": "BLOCKLIST",
+            "PROHIBITED": "PROHIBITED_CONTENT",
+            "PROHIBITED_CONTENT": "PROHIBITED_CONTENT",
+            "CONTENT_FILTERED": "BLOCKLIST",
+        }
+        return aliases.get(normalized, normalized)
+
+    return str(value)
+
+
 async def _call_model(
     prompt: str,
     *,
@@ -34,11 +70,18 @@ async def _call_model(
     prompt = truncate_text(prompt, 12000)
 
     def _sync_call(current_prompt: str, current_max_tokens: int | None) -> tuple[Optional[str], dict]:
+        meta: dict = {
+            "finish_reason": "NONE",
+            "usage_metadata": None,
+            "prompt_feedback": None,
+        }
+
         try:
             model = genai.GenerativeModel(CONFIG.AI_MODEL)
         except Exception as e:  # noqa: BLE001
             logger.exception("Ошибка инициализации модели: %s", e)
-            return None, {}
+            return None, meta
+
         try:
             generation_config = {"temperature": temperature, **(extra_config or {})}
             if current_max_tokens is not None:
@@ -49,15 +92,20 @@ async def _call_model(
             )
         except Exception as e:  # noqa: BLE001
             logger.exception("Ошибка вызова модели: %s", e)
-            return None, {}
+            return None, meta
 
-        finish_reason = None
-        meta: dict = {}
         try:
-            finish_reason = getattr(response, "candidates", [None])[0].finish_reason  # type: ignore[index]
-        except Exception:
-            pass
-        meta["finish_reason"] = finish_reason
+            candidates = list(getattr(response, "candidates", None) or [])
+        except Exception:  # noqa: BLE001
+            candidates = []
+
+        finish_reason_raw = None
+        if candidates:
+            try:
+                finish_reason_raw = getattr(candidates[0], "finish_reason", None)
+            except Exception:  # noqa: BLE001
+                finish_reason_raw = None
+        meta["finish_reason"] = _normalize_finish_reason(finish_reason_raw)
         meta["usage_metadata"] = getattr(response, "usage_metadata", None)
         meta["prompt_feedback"] = getattr(response, "prompt_feedback", None)
 
@@ -68,61 +116,58 @@ async def _call_model(
         except Exception as e:  # noqa: BLE001
             logger.debug("Модель не вернула .text, пробуем кандидатов: %s", e)
 
-        try:
-            candidates = list(getattr(response, "candidates", None) or [])
-            if not candidates:
-                logger.warning("Модель вернула пустой список candidates")
-                return None, meta
-
-            cand0 = candidates[0]
-            finish_reason = getattr(cand0, "finish_reason", None)
-
-            bad_reasons = {"SAFETY", "BLOCKED", "OTHER", "RECITATION"}
-            bad_codes = {3, 4}
-
-            warning_logged = False
-            if finish_reason in bad_reasons or finish_reason in bad_codes:
-                logger.warning(
-                    "Модель завершилась с проблемной finish_reason=%r, текст не используем",
-                    finish_reason,
-                )
-                warning_logged = True
-                return None, meta
-
-            content = getattr(cand0, "content", None)
-            parts = getattr(content, "parts", None) if content is not None else None
-
-            texts: list[str] = []
-            if parts:
-                for p in parts:
-                    t = getattr(p, "text", None)
-                    if t:
-                        texts.append(t)
-
-            if finish_reason == "MAX_TOKENS" and not texts:
-                logger.warning(
-                    "finish_reason=MAX_TOKENS без текстовых частей | usage=%r | prompt_feedback=%r",
-                    meta.get("usage_metadata"),
-                    meta.get("prompt_feedback"),
-                )
-                return None, meta
-
-            if not texts:
-                if not warning_logged and finish_reason:
-                    logger.warning(
-                        "Кандидат без текста, finish_reason=%r | usage=%r | prompt_feedback=%r",
-                        finish_reason,
-                        meta.get("usage_metadata"),
-                        meta.get("prompt_feedback"),
-                    )
-                else:
-                    logger.debug("Кандидат без текстовых частей, cand0=%r", cand0)
-                return None, meta
-
-            return "\n".join(texts), meta
-        except Exception:  # noqa: BLE001
-            logger.exception("Не удалось извлечь текст из ответа модели")
+        if not candidates:
+            logger.warning("Модель вернула пустой список candidates")
             return None, meta
+
+        candidate = candidates[0]
+        finish_reason = meta.get("finish_reason", "OTHER")
+
+        blocked_reasons = {
+            "SAFETY",
+            "BLOCKLIST",
+            "PROHIBITED_CONTENT",
+            "SPII",
+            "OTHER",
+            "RECITATION",
+        }
+        if finish_reason in blocked_reasons:
+            logger.warning(
+                "Модель завершилась с проблемной finish_reason='%s', текст не используем | usage=%r | prompt_feedback=%r",
+                finish_reason,
+                meta.get("usage_metadata"),
+                meta.get("prompt_feedback"),
+            )
+            return None, meta
+
+        content = getattr(candidate, "content", None)
+        parts = getattr(content, "parts", None) if content is not None else None
+
+        texts: list[str] = []
+        if parts:
+            for part in parts:
+                t = getattr(part, "text", None)
+                if t:
+                    texts.append(t)
+
+        if finish_reason == "MAX_TOKENS" and not texts:
+            logger.warning(
+                "finish_reason='MAX_TOKENS' без текстовых частей | usage=%r | prompt_feedback=%r",
+                meta.get("usage_metadata"),
+                meta.get("prompt_feedback"),
+            )
+            return None, meta
+
+        if not texts:
+            logger.warning(
+                "Кандидат без текста, finish_reason='%s' | usage=%r | prompt_feedback=%r",
+                finish_reason,
+                meta.get("usage_metadata"),
+                meta.get("prompt_feedback"),
+            )
+            return None, meta
+
+        return "\n".join(texts), meta
 
     def _extract_user_request(text: str) -> str:
         for marker in ["=== Новый запрос пользователя ===", "=== ЗАПРОС ===", "=== ЗАПРОС ПОЛЬЗОВАТЕЛЯ ==="]:
@@ -132,17 +177,18 @@ async def _call_model(
 
     try:
         result, meta = await asyncio.to_thread(_sync_call, prompt, max_output_tokens)
-        finish_reason = meta.get("finish_reason")
+        finish_reason = _normalize_finish_reason(meta.get("finish_reason"))
+
         if result:
             return result
 
         if finish_reason == "MAX_TOKENS":
             logger.warning(
-                "Пустой ответ от модели: finish_reason=MAX_TOKENS | usage=%r | prompt_feedback=%r",
+                "Пустой ответ от модели: finish_reason='MAX_TOKENS' | usage=%r | prompt_feedback=%r",
                 meta.get("usage_metadata"),
                 meta.get("prompt_feedback"),
             )
-            expanded_tokens = None if max_output_tokens is None else max(max_output_tokens * 2, 1024)
+            expanded_tokens = None if max_output_tokens is None else max(max_output_tokens * 2, 2048)
             try:
                 retry_result, retry_meta = await asyncio.to_thread(
                     _sync_call, prompt, expanded_tokens
@@ -150,38 +196,45 @@ async def _call_model(
                 if retry_result:
                     return retry_result
                 logger.warning(
-                    "Повторный вызов после MAX_TOKENS тоже без текста | finish_reason=%r | usage=%r | prompt_feedback=%r",
-                    retry_meta.get("finish_reason"),
+                    "Повторный вызов после MAX_TOKENS тоже без текста | finish_reason='%s' | usage=%r | prompt_feedback=%r",
+                    _normalize_finish_reason(retry_meta.get("finish_reason")),
                     retry_meta.get("usage_metadata"),
                     retry_meta.get("prompt_feedback"),
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("Ошибка при повторном вызове модели после MAX_TOKENS")
 
-        if not result:
-            logger.warning(
-                "Пустой ответ от модели: finish_reason=%r | usage=%r | prompt_feedback=%r",
-                finish_reason,
-                meta.get("usage_metadata"),
-                meta.get("prompt_feedback"),
-            )
-            return (
-                "Не удалось сгенерировать ответ из-за ограничения по длине. Попробуйте задать вопрос короче."
-                if finish_reason == "MAX_TOKENS"
-                else None
-            )
-
         if retry_without_context:
-            user_request = _extract_user_request(prompt)
-            simple_prompt = (
-                "Ответь по-русски на следующий запрос кратко и по делу:\n\n"
-                f"{user_request}"
-            )
-            return await asyncio.to_thread(
-                lambda p, t: _sync_call(p, t)[0],
-                truncate_text(simple_prompt, 4000),
-                200,
-            )
+            try:
+                user_request = _extract_user_request(prompt)
+                simple_prompt = (
+                    "Ответь по-русски на следующий запрос кратко и по делу:\n\n"
+                    f"{user_request}"
+                )
+                simple_prompt = truncate_text(simple_prompt, 4000)
+                retry_result, retry_meta = await asyncio.to_thread(
+                    _sync_call, simple_prompt, 200
+                )
+                if retry_result:
+                    return retry_result
+                finish_reason = _normalize_finish_reason(retry_meta.get("finish_reason"))
+                logger.warning(
+                    "Повтор без контекста не дал результата | finish_reason='%s' | usage=%r | prompt_feedback=%r",
+                    finish_reason,
+                    retry_meta.get("usage_metadata"),
+                    retry_meta.get("prompt_feedback"),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Ошибка при повторном вызове модели без контекста")
+
+        logger.warning(
+            "Пустой ответ от модели: finish_reason='%s' | usage=%r | prompt_feedback=%r",
+            finish_reason,
+            meta.get("usage_metadata"),
+            meta.get("prompt_feedback"),
+        )
+        if finish_reason == "MAX_TOKENS":
+            return "Не удалось сгенерировать ответ из-за ограничения по длине. Попробуйте задать вопрос короче."
     except Exception:  # noqa: BLE001
         logger.exception("Ошибка при вызове модели")
     return None
