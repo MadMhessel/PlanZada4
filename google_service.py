@@ -385,6 +385,7 @@ def update_last_seen(telegram_user_id: int) -> None:
 
 def create_personal_note(profile: dict, note_text: str, tags: Optional[List[str]] = None, **_: str) -> str:
     try:
+        ensure_structures()
         note_id = str(uuid.uuid4())
         now = _now_iso()
         tags_str = ",".join(tags or [])
@@ -395,6 +396,7 @@ def create_personal_note(profile: dict, note_text: str, tags: Optional[List[str]
 
 
 def read_personal_notes(profile: dict, limit: int = 5, **_: str) -> str:
+    ensure_structures()
     notes = _read_values(PERSONAL_NOTES_SHEET)
     filtered = [n for n in notes if n and n[1] == str(profile.get("user_id"))]
     try:
@@ -410,6 +412,7 @@ def read_personal_notes(profile: dict, limit: int = 5, **_: str) -> str:
 
 
 def search_personal_notes(profile: dict, query: str, limit: int = 5, **_: str) -> str:
+    ensure_structures()
     notes = _read_values(PERSONAL_NOTES_SHEET)
     filtered = [n for n in notes if n and n[1] == str(profile.get("user_id")) and query.lower() in (n[2].lower())]
     try:
@@ -424,6 +427,7 @@ def search_personal_notes(profile: dict, query: str, limit: int = 5, **_: str) -
 
 
 def update_personal_note(profile: dict, note_id: str, fields: Dict[str, str], **_: str) -> str:
+    ensure_structures()
     rows = _read_values(PERSONAL_NOTES_SHEET)
     for idx, row in enumerate(rows, start=2):
         if row and row[0] == note_id and row[1] == str(profile.get("user_id")):
@@ -436,6 +440,7 @@ def update_personal_note(profile: dict, note_id: str, fields: Dict[str, str], **
 
 
 def delete_personal_note(profile: dict, note_id: str, **_: str) -> str:
+    ensure_structures()
     rows = _read_values(PERSONAL_NOTES_SHEET)
     keep: List[List[str]] = []
     deleted = False
