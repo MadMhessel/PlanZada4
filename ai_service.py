@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import asyncio
-import datetime as dt
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import google.generativeai as genai
 
@@ -20,28 +19,22 @@ api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GENAI_API_KEY")
 if api_key:
     genai.configure(api_key=api_key)
 
-_model: Optional[genai.GenerativeModel] = None
 
-
-def _get_model() -> Optional[genai.GenerativeModel]:
-    """Lazy init model with graceful degradation."""
-    global _model
-    if _model is None:
-        try:
-            _model = genai.GenerativeModel(CONFIG.ai_model)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Falling back to heuristic AI: %s", exc)
-            _model = None
-    return _model
-
-
-async def _call_model(prompt: str, *, temperature: float = 0.2, max_output_tokens: int = 512) -> Optional[str]:
-    """Call generative model safely in a thread."""
-    model = _get_model()
-    if not model:
-        return None
+async def _call_model(
+    prompt: str,
+    *,
+    temperature: float = 0.2,
+    max_output_tokens: int = 512,
+) -> Optional[str]:
+    """Безопасный вызов модели Gemini с обработкой всех вариантов ответа."""
 
     def _sync_call() -> Optional[str]:
+        try:
+            model = genai.GenerativeModel(CONFIG.ai_model)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Ошибка инициализации модели: %s", exc)
+            return None
+
         try:
             response = model.generate_content(
                 prompt,
@@ -51,9 +44,47 @@ async def _call_model(prompt: str, *, temperature: float = 0.2, max_output_token
                 },
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Model call failed: %s", exc)
+            logger.exception("Ошибка вызова модели: %s", exc)
             return None
-        return getattr(response, "text", None)
+
+        try:
+            return response.text  # может бросить ValueError
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Модель не вернула .text, пробуем разобрать кандидатов: %s", exc)
+
+        try:
+            candidates = getattr(response, "candidates", None) or []
+            if not candidates:
+                logger.warning("Модель вернула пустой список candidates")
+                return None
+
+            cand0 = candidates[0]
+            finish_reason = getattr(cand0, "finish_reason", None)
+            if finish_reason not in (1, "STOP", None):
+                logger.warning(
+                    "Модель завершила генерацию с finish_reason=%r, текст не используем",
+                    finish_reason,
+                )
+                return None
+
+            content = getattr(cand0, "content", None)
+            parts = getattr(content, "parts", None) if content is not None else None
+
+            texts: list[str] = []
+            if parts:
+                for part in parts:
+                    text_part = getattr(part, "text", None)
+                    if text_part:
+                        texts.append(text_part)
+
+            if not texts:
+                logger.warning("Кандидат без текстовых частей, cand0=%r", cand0)
+                return None
+
+            return "\n".join(texts)
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось извлечь текст из ответа модели")
+            return None
 
     return await asyncio.to_thread(_sync_call)
 
@@ -305,26 +336,65 @@ async def free_chat(profile: dict, question: str, context_text: str | None = Non
     return text or "Готово."
 
 
-async def build_reminder_text(tasks: List[dict], profile: Optional[dict] = None) -> str:
-    current_time = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-    tasks_json = json.dumps(tasks, ensure_ascii=False, indent=2)
-    prompt = (
-        "Ты — дружелюбный секретарь. Составь короткое напоминание о задачах.\n"
-        f"Текущее время: {current_time}.\n"
-        f"Список задач в JSON:\n{tasks_json}\n"
-        "Ответь обычным текстом (русский), без JSON и без форматирования Markdown."
-        "Сначала скажи, что это напоминание, затем перечисли просроченные и ближайшие задачи."
-    )
+async def build_reminder_text(tasks: list[dict], user: dict) -> str:
+    """Формирует текст напоминания с использованием модели и безопасным фолбэком."""
+
+    user_name = user.get("display_name") or user.get("telegram_full_name") or "Коллега"
+
+    prompt = f"""
+Ты — персональный ассистент и секретарь.
+
+Пользователь: {user_name}
+Нужно составить краткое напоминание о его задачах.
+
+Список задач:
+{_format_tasks_for_prompt(tasks)}
+
+Сделай:
+
+вежливое обращение к пользователю по имени;
+
+короткий текст напоминания;
+
+перечисли задачи по пунктам.
+
+Ответ отдай одним цельным текстом на русском языке.
+""".strip()
+
     text = await _call_model(prompt, temperature=0.2, max_output_tokens=400)
+
     if text:
-        return text
-    overdue = [t for t in tasks if t.get("is_overdue")]
-    upcoming = [t for t in tasks if not t.get("is_overdue")]
-    parts: List[str] = ["Напоминание о задачах:"]
-    if overdue:
-        parts.append("Просроченные:")
-        parts.extend(f"- {t.get('title')} (до {t.get('due_datetime')})" for t in overdue)
-    if upcoming:
-        parts.append("Ближайшие:")
-        parts.extend(f"- {t.get('title')} (до {t.get('due_datetime')})" for t in upcoming)
-    return "\n".join(parts) if len(parts) > 1 else "На сейчас у вас нет задач, требующих внимания."
+        return text.strip()
+
+    lines: list[str] = []
+    lines.append(f"{user_name}, напоминаю о ваших задачах:")
+
+    if not tasks:
+        lines.append("На данный момент у вас нет активных задач.")
+        return "\n".join(lines)
+
+    for idx, task in enumerate(tasks, start=1):
+        title = task.get("title") or task.get("name") or "Задача без названия"
+        due = task.get("due") or task.get("due_datetime_local") or ""
+        if due:
+            lines.append(f"{idx}) {title} — срок: {due}")
+        else:
+            lines.append(f"{idx}) {title}")
+
+    return "\n".join(lines)
+
+
+def _format_tasks_for_prompt(tasks: list[dict]) -> str:
+    """Подготавливает список задач для передачи в промт модели."""
+
+    if not tasks:
+        return "Нет активных задач."
+
+    lines: list[str] = []
+    for idx, task in enumerate(tasks[:10], start=1):
+        title = task.get("title") or task.get("name") or "Задача без названия"
+        due = task.get("due") or task.get("due_datetime_local") or "срок не указан"
+        status = task.get("status") or "open"
+        lines.append(f"{idx}) [{status}] {title} (срок: {due})")
+
+    return "\n".join(lines)
