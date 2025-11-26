@@ -156,6 +156,8 @@ async def handle_any_message(message: Message, state: FSMContext) -> None:
         return
 
     reply_text = result.user_visible_answer or "Запрос обработан."
+    if not str(reply_text).strip():
+        reply_text = "У меня возникла ошибка при ответе. Попробуйте задать вопрос иначе."
     try:
         await message.answer(reply_text)
     except Exception as exc:  # noqa: BLE001
@@ -175,11 +177,8 @@ async def reminder_worker() -> None:
                     if str(user.get("notify_telegram", "")).lower() not in {"true", "1", "yes", "y"}:
                         continue
 
-                    raw_chat_id = user.get("telegram_chat_id") or user.get("telegram_user_id")
-                    try:
-                        chat_id = int(raw_chat_id)
-                    except (TypeError, ValueError):
-                        logger.warning("Пропускаю напоминание: некорректный chat_id=%r", raw_chat_id)
+                    chat_id = google_service.get_valid_chat_id(user)
+                    if chat_id is None:
                         continue
 
                     tasks = google_service.upcoming_tasks_for_user(user.get("user_id", ""))

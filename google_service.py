@@ -211,6 +211,30 @@ def _now_iso() -> str:
     return dt.datetime.utcnow().isoformat()
 
 
+def _normalize_numeric_id(value: str | int | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    try:
+        return str(int(text))
+    except (TypeError, ValueError):
+        logger.warning("Игнорирую %s: ожидается числовой идентификатор, получено %r", field_name, value)
+        return None
+
+
+def get_valid_chat_id(user: dict) -> int | None:
+    raw_chat_id = user.get("telegram_chat_id") or user.get("telegram_user_id")
+    normalized = _normalize_numeric_id(raw_chat_id, "telegram_chat_id")
+    if normalized is None:
+        logger.warning(
+            "Пропускаю напоминание для user_id=%r: некорректный chat_id=%r",
+            user.get("user_id"),
+            raw_chat_id,
+        )
+        return None
+    return int(normalized)
+
+
 # Users
 
 def _read_users() -> List[Dict[str, str]]:
@@ -295,12 +319,24 @@ def create_or_update_user_profile(profile: dict) -> dict:
     for idx, user in enumerate(users):
         if str(user.get("telegram_user_id")) == str(profile.get("telegram_user_id")):
             updated = {**user, **profile, "last_seen_at": _now_iso()}
+            normalized_chat_id = _normalize_numeric_id(updated.get("telegram_user_id"), "telegram_user_id")
+            if normalized_chat_id is not None:
+                updated["telegram_user_id"] = normalized_chat_id
+                updated["telegram_chat_id"] = normalized_chat_id
+            else:
+                updated["telegram_chat_id"] = ""
+                updated["telegram_user_id"] = ""
             users[idx] = updated
             _write_users(users)
             return updated
+    normalized_chat_id = _normalize_numeric_id(profile.get("telegram_user_id"), "telegram_user_id")
+    if normalized_chat_id is None:
+        normalized_chat_id = ""
     profile = {
-        "user_id": profile.get("user_id") or str(profile.get("telegram_user_id")),
+        "user_id": profile.get("user_id") or normalized_chat_id or str(profile.get("telegram_user_id")),
         **profile,
+        "telegram_user_id": normalized_chat_id,
+        "telegram_chat_id": normalized_chat_id,
         "created_at": profile.get("created_at") or _now_iso(),
         "last_seen_at": profile.get("last_seen_at") or _now_iso(),
     }

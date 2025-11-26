@@ -24,7 +24,7 @@ async def _call_model(
     prompt: str,
     *,
     temperature: float = 0.2,
-    max_output_tokens: int = 512,
+    max_output_tokens: int | None = 1024,
     extra_config: dict | None = None,
 
     retry_without_context: bool = False,
@@ -33,27 +33,38 @@ async def _call_model(
 
     prompt = truncate_text(prompt, 12000)
 
-    def _sync_call(current_prompt: str, current_max_tokens: int) -> Optional[str]:
+    def _sync_call(current_prompt: str, current_max_tokens: int | None) -> tuple[Optional[str], dict]:
         try:
             model = genai.GenerativeModel(CONFIG.AI_MODEL)
         except Exception as e:  # noqa: BLE001
             logger.exception("Ошибка инициализации модели: %s", e)
-            return None
+            return None, {}
         try:
+            generation_config = {"temperature": temperature, **(extra_config or {})}
+            if current_max_tokens is not None:
+                generation_config["max_output_tokens"] = current_max_tokens
             response = model.generate_content(
                 current_prompt,
-                generation_config={
-                    "temperature": temperature,
-                    "max_output_tokens": current_max_tokens,
-                    **(extra_config or {}),
-                },
+                generation_config=generation_config,
             )
         except Exception as e:  # noqa: BLE001
             logger.exception("Ошибка вызова модели: %s", e)
-            return None
+            return None, {}
+
+        finish_reason = None
+        meta: dict = {}
+        try:
+            finish_reason = getattr(response, "candidates", [None])[0].finish_reason  # type: ignore[index]
+        except Exception:
+            pass
+        meta["finish_reason"] = finish_reason
+        meta["usage_metadata"] = getattr(response, "usage_metadata", None)
+        meta["prompt_feedback"] = getattr(response, "prompt_feedback", None)
 
         try:
-            return response.text  # может бросить ValueError
+            text = response.text  # может бросить ValueError
+            if text:
+                return text, meta
         except Exception as e:  # noqa: BLE001
             logger.debug("Модель не вернула .text, пробуем кандидатов: %s", e)
 
@@ -61,7 +72,7 @@ async def _call_model(
             candidates = list(getattr(response, "candidates", None) or [])
             if not candidates:
                 logger.warning("Модель вернула пустой список candidates")
-                return None
+                return None, meta
 
             cand0 = candidates[0]
             finish_reason = getattr(cand0, "finish_reason", None)
@@ -76,7 +87,7 @@ async def _call_model(
                     finish_reason,
                 )
                 warning_logged = True
-                return None
+                return None, meta
 
             content = getattr(cand0, "content", None)
             parts = getattr(content, "parts", None) if content is not None else None
@@ -89,20 +100,29 @@ async def _call_model(
                         texts.append(t)
 
             if finish_reason == "MAX_TOKENS" and not texts:
-                logger.warning("finish_reason=MAX_TOKENS без текстовых частей")
-                return None
+                logger.warning(
+                    "finish_reason=MAX_TOKENS без текстовых частей | usage=%r | prompt_feedback=%r",
+                    meta.get("usage_metadata"),
+                    meta.get("prompt_feedback"),
+                )
+                return None, meta
 
             if not texts:
                 if not warning_logged and finish_reason:
-                    logger.warning("Кандидат без текста, finish_reason=%r", finish_reason)
+                    logger.warning(
+                        "Кандидат без текста, finish_reason=%r | usage=%r | prompt_feedback=%r",
+                        finish_reason,
+                        meta.get("usage_metadata"),
+                        meta.get("prompt_feedback"),
+                    )
                 else:
                     logger.debug("Кандидат без текстовых частей, cand0=%r", cand0)
-                return None
+                return None, meta
 
-            return "\n".join(texts)
+            return "\n".join(texts), meta
         except Exception:  # noqa: BLE001
             logger.exception("Не удалось извлечь текст из ответа модели")
-            return None
+            return None, meta
 
     def _extract_user_request(text: str) -> str:
         for marker in ["=== Новый запрос пользователя ===", "=== ЗАПРОС ===", "=== ЗАПРОС ПОЛЬЗОВАТЕЛЯ ==="]:
@@ -111,9 +131,45 @@ async def _call_model(
         return text
 
     try:
-        result = await asyncio.to_thread(_sync_call, prompt, max_output_tokens)
+        result, meta = await asyncio.to_thread(_sync_call, prompt, max_output_tokens)
+        finish_reason = meta.get("finish_reason")
         if result:
             return result
+
+        if finish_reason == "MAX_TOKENS":
+            logger.warning(
+                "Пустой ответ от модели: finish_reason=MAX_TOKENS | usage=%r | prompt_feedback=%r",
+                meta.get("usage_metadata"),
+                meta.get("prompt_feedback"),
+            )
+            expanded_tokens = None if max_output_tokens is None else max(max_output_tokens * 2, 1024)
+            try:
+                retry_result, retry_meta = await asyncio.to_thread(
+                    _sync_call, prompt, expanded_tokens
+                )
+                if retry_result:
+                    return retry_result
+                logger.warning(
+                    "Повторный вызов после MAX_TOKENS тоже без текста | finish_reason=%r | usage=%r | prompt_feedback=%r",
+                    retry_meta.get("finish_reason"),
+                    retry_meta.get("usage_metadata"),
+                    retry_meta.get("prompt_feedback"),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Ошибка при повторном вызове модели после MAX_TOKENS")
+
+        if not result:
+            logger.warning(
+                "Пустой ответ от модели: finish_reason=%r | usage=%r | prompt_feedback=%r",
+                finish_reason,
+                meta.get("usage_metadata"),
+                meta.get("prompt_feedback"),
+            )
+            return (
+                "Не удалось сгенерировать ответ из-за ограничения по длине. Попробуйте задать вопрос короче."
+                if finish_reason == "MAX_TOKENS"
+                else None
+            )
 
         if retry_without_context:
             user_request = _extract_user_request(prompt)
@@ -122,7 +178,7 @@ async def _call_model(
                 f"{user_request}"
             )
             return await asyncio.to_thread(
-                _sync_call,
+                lambda p, t: _sync_call(p, t)[0],
                 truncate_text(simple_prompt, 4000),
                 200,
             )
