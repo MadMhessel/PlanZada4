@@ -54,6 +54,8 @@ METHOD_MAP: Dict[str, Callable] = {
     "debug_on": debug_service.debug_on,
     "debug_off": debug_service.debug_off,
     "debug_status": debug_service.debug_status,
+    "debug_create_test_event": debug_service.create_test_calendar_event,
+    "debug_show_today_agenda": debug_service.show_today_agenda,
     "chat": chat_handler,
 }
 

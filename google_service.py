@@ -8,7 +8,10 @@ import time
 import uuid
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
+import caldav
+from icalendar import Calendar, Event
 from google.auth import default as google_default_credentials
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -70,7 +73,17 @@ TEAM_TASKS_COLUMNS = [
 
 _sheets_service = None
 _calendar_service = None
+_yandex_client = None
+_yandex_calendar = None
 _users_cache: List[Dict[str, str]] | None = None
+
+
+def _is_google_calendar() -> bool:
+    return (CONFIG.calendar_provider or "google").lower() == "google"
+
+
+def _is_yandex_calendar() -> bool:
+    return (CONFIG.calendar_provider or "google").lower() == "yandex"
 
 
 def _get_credentials():
@@ -107,6 +120,17 @@ def _with_retries(func: Callable, *args, **kwargs):
             if attempt >= 1:
                 raise
             time.sleep(1 + attempt)
+
+
+def _with_retries_caldav(func: Callable, *args, **kwargs):
+    for attempt in range(3):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CalDAV error on attempt %s: %s", attempt + 1, exc)
+            if attempt >= 2:
+                raise
+            time.sleep(2 + attempt * 2)
 
 
 def get_sheets_service():
@@ -458,7 +482,7 @@ def create_personal_task(profile: dict, **params) -> str:
             params.get("calendar_event_id", ""),
         ]
         _append_row(PERSONAL_TASKS_SHEET, row)
-        if CONFIG.calendar_id and params.get("due_datetime"):
+        if _calendar_configured_for_creation() and params.get("due_datetime"):
             attendees = _collect_attendees([profile.get("user_id")])
             create_or_update_event(
                 profile,
@@ -526,7 +550,7 @@ def create_team_task(profile: dict, **params) -> str:
         ]
         _append_row(TEAM_TASKS_SHEET, row)
         attendees = _collect_attendees(assignee_ids + [profile.get("user_id")])
-        if CONFIG.calendar_id and params.get("due_datetime"):
+        if _calendar_configured_for_creation() and params.get("due_datetime"):
             create_or_update_event(
                 profile,
                 title=params.get("title", ""),
@@ -574,6 +598,15 @@ def list_team_tasks(profile: dict, status: Optional[str] = None, **_: str) -> st
 
 # Calendar
 
+
+def _calendar_configured_for_creation() -> bool:
+    if _is_google_calendar():
+        return bool(CONFIG.calendar_id)
+    if _is_yandex_calendar():
+        return bool(CONFIG.yandex_calendar_login and CONFIG.yandex_calendar_password)
+    return False
+
+
 def _collect_attendees(user_ids: List[str]) -> List[str]:
     emails: List[str] = []
     for uid in user_ids:
@@ -588,6 +621,132 @@ def _collect_attendees(user_ids: List[str]) -> List[str]:
     return emails
 
 
+def _get_timezone(tz_name: str | None) -> ZoneInfo:
+    try:
+        return ZoneInfo(tz_name or "Europe/Moscow")
+    except Exception:  # noqa: BLE001
+        logger.warning("Unknown timezone %s, falling back to UTC", tz_name)
+        return ZoneInfo("UTC")
+
+
+def _parse_datetime_with_timezone(value: str, profile: dict) -> dt.datetime:
+    tz = _get_timezone(profile.get("timezone") or "Europe/Moscow")
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except Exception:  # noqa: BLE001
+        logger.warning("Failed to parse datetime %r, using current time", value)
+        return dt.datetime.now(tz)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=tz)
+    return parsed.astimezone(tz)
+
+
+def _format_datetime_for_output(value: dt.datetime | dt.date) -> str:
+    if isinstance(value, dt.datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def _get_yandex_calendar():
+    global _yandex_client, _yandex_calendar
+    if _yandex_calendar is not None:
+        return _yandex_calendar
+    if not (CONFIG.yandex_calendar_login and CONFIG.yandex_calendar_password):
+        raise RuntimeError("Яндекс.Календарь не сконфигурирован.")
+
+    try:
+        client = caldav.DAVClient(
+            url=CONFIG.yandex_caldav_url or "https://caldav.yandex.ru/",
+            username=CONFIG.yandex_calendar_login,
+            password=CONFIG.yandex_calendar_password,
+        )
+        principal = client.principal()
+        calendars = _with_retries_caldav(principal.calendars)
+        if not calendars:
+            raise RuntimeError("Не удалось получить список календарей Яндекс.")
+
+        selected = None
+        if CONFIG.yandex_calendar_name:
+            for calendar in calendars:
+                try:
+                    props = calendar.get_properties([caldav.elements.dav.DisplayName()])
+                    display_name = props.get("{DAV:}displayname")
+                    if display_name == CONFIG.yandex_calendar_name:
+                        selected = calendar
+                        break
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Не удалось прочитать название календаря: %s", exc)
+        if selected is None:
+            selected = calendars[0]
+
+        _yandex_client = client
+        _yandex_calendar = selected
+        return selected
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to init Yandex Calendar: %s", exc)
+        raise RuntimeError("Не удалось подключиться к Яндекс.Календарю.") from exc
+
+
+def _create_or_update_event_google(
+    profile: dict,
+    title: str,
+    description: str,
+    start_datetime: str,
+    end_datetime: Optional[str],
+    attendees: Optional[List[str]],
+    link_task_id: Optional[str],
+) -> str:
+    if not CONFIG.calendar_id:
+        return "Календарь не сконфигурирован."
+    service = get_calendar_service()
+    event_body = {
+        "summary": title,
+        "description": description if not link_task_id else f"{description}\nСвязано с задачей: {link_task_id}",
+        "start": {"dateTime": start_datetime, "timeZone": profile.get("timezone", "UTC")},
+        "end": {"dateTime": end_datetime or start_datetime, "timeZone": profile.get("timezone", "UTC")},
+    }
+    attendees = attendees or []
+    if attendees:
+        event_body["attendees"] = [{"email": e} for e in attendees]
+    created = _with_retries(
+        service.events().insert(calendarId=CONFIG.calendar_id, body=event_body, sendUpdates="all" if attendees else "none").execute
+    )
+    return f"Событие создано ({created.get('id')})."
+
+
+def _create_or_update_event_yandex(
+    profile: dict,
+    title: str,
+    description: str,
+    start_datetime: str,
+    end_datetime: Optional[str],
+    attendees: Optional[List[str]],
+    link_task_id: Optional[str],
+) -> str:
+    calendar = _get_yandex_calendar()
+    start_dt = _parse_datetime_with_timezone(start_datetime, profile)
+    end_dt = _parse_datetime_with_timezone(end_datetime, profile) if end_datetime else start_dt
+    cal = Calendar()
+    cal.add("prodid", "-//AI Secretary//YA//")
+    cal.add("version", "2.0")
+
+    event = Event()
+    uid = link_task_id or str(uuid.uuid4())
+    event.add("uid", uid)
+    event.add("summary", title)
+    desc = description if not link_task_id else f"{description}\nСвязано с задачей: {link_task_id}"
+    event.add("description", desc)
+    event.add("dtstart", start_dt)
+    event.add("dtend", end_dt)
+    for attendee in attendees or []:
+        event.add("attendee", f"MAILTO:{attendee}")
+
+    cal.add_component(event)
+    data = cal.to_ical()
+    _with_retries_caldav(calendar.add_event, data)
+    return f"Событие создано ({uid})."
+
+
 def create_or_update_event(
     profile: dict,
     title: str,
@@ -598,54 +757,89 @@ def create_or_update_event(
     link_task_id: Optional[str] = None,
     **_: str,
 ) -> str:
-    if not CONFIG.calendar_id:
-        return "Календарь не сконфигурирован."
     try:
-        service = get_calendar_service()
-        event_body = {
-            "summary": title,
-            "description": description if not link_task_id else f"{description}\nСвязано с задачей: {link_task_id}",
-            "start": {"dateTime": start_datetime, "timeZone": profile.get("timezone", "UTC")},
-            "end": {"dateTime": end_datetime or start_datetime, "timeZone": profile.get("timezone", "UTC")},
-        }
-        attendees = attendees or []
-        if attendees:
-            event_body["attendees"] = [{"email": e} for e in attendees]
-        created = _with_retries(
-            service.events().insert(calendarId=CONFIG.calendar_id, body=event_body, sendUpdates="all" if attendees else "none").execute
-        )
-        return f"Событие создано ({created.get('id')})."
+        if _is_google_calendar():
+            return _create_or_update_event_google(profile, title, description, start_datetime, end_datetime, attendees, link_task_id)
+        if _is_yandex_calendar():
+            return _create_or_update_event_yandex(profile, title, description, start_datetime, end_datetime, attendees, link_task_id)
+        return "Календарный провайдер не настроен."
     except Exception as exc:  # noqa: BLE001
         logger.exception("Calendar operation failed: %s", exc)
-        return "Не удалось выполнить действие с Google (таблица/календарь). Я пробовал несколько раз. Попробуйте позже."
+        return "Не удалось выполнить действие с календарём. Я пробовал несколько раз. Попробуйте позже."
+
+
+def _show_calendar_agenda_google(
+    profile: dict, from_datetime: Optional[str] = None, to_datetime: Optional[str] = None
+) -> str:
+    if not CONFIG.calendar_id:
+        return "Календарь не сконфигурирован."
+    now_iso = dt.datetime.utcnow().isoformat() + "Z"
+    params = {
+        "calendarId": CONFIG.calendar_id,
+        "timeMin": (from_datetime or now_iso),
+        "maxResults": 10,
+        "singleEvents": True,
+        "orderBy": "startTime",
+    }
+    if to_datetime:
+        params["timeMax"] = to_datetime
+    events = _with_retries(get_calendar_service().events().list(**params).execute).get("items", [])
+    if not events:
+        return "Ближайших событий нет."
+    lines = []
+    for ev in events:
+        start = ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date")
+        lines.append(f"• {ev.get('summary')} — {start}")
+    return "\n".join(lines)
+
+
+def _show_calendar_agenda_yandex(
+    profile: dict, from_datetime: Optional[str] = None, to_datetime: Optional[str] = None
+) -> str:
+    calendar = _get_yandex_calendar()
+    tz = _get_timezone(profile.get("timezone") or "Europe/Moscow")
+    start = _parse_datetime_with_timezone(from_datetime, profile) if from_datetime else dt.datetime.now(tz)
+    end = _parse_datetime_with_timezone(to_datetime, profile) if to_datetime else start + dt.timedelta(days=7)
+
+    events = _with_retries_caldav(calendar.date_search, start, end)
+    if not events:
+        return "Ближайших событий нет."
+
+    lines: List[str] = []
+    for ev in events:
+        try:
+            ical_data = Calendar.from_ical(ev.data)
+            for component in ical_data.walk("VEVENT"):
+                summary = component.get("summary", "Без названия")
+                dtstart = component.get("dtstart")
+                if dtstart is None:
+                    continue
+                start_value = dtstart.dt
+                if isinstance(start_value, dt.datetime):
+                    if start_value.tzinfo is None:
+                        start_value = start_value.replace(tzinfo=tz)
+                    else:
+                        start_value = start_value.astimezone(tz)
+                lines.append(f"• {summary} — {_format_datetime_for_output(start_value)}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to parse Yandex event: %s", exc)
+            continue
+
+    if not lines:
+        return "Ближайших событий нет."
+    return "\n".join(lines)
 
 
 def show_calendar_agenda(profile: dict, from_datetime: Optional[str] = None, to_datetime: Optional[str] = None, **_: str) -> str:
-    if not CONFIG.calendar_id:
-        return "Календарь не сконфигурирован."
     try:
-        service = get_calendar_service()
-        now_iso = dt.datetime.utcnow().isoformat() + "Z"
-        params = {
-            "calendarId": CONFIG.calendar_id,
-            "timeMin": (from_datetime or now_iso),
-            "maxResults": 10,
-            "singleEvents": True,
-            "orderBy": "startTime",
-        }
-        if to_datetime:
-            params["timeMax"] = to_datetime
-        events = _with_retries(service.events().list(**params).execute).get("items", [])
-        if not events:
-            return "Ближайших событий нет."
-        lines = []
-        for ev in events:
-            start = ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date")
-            lines.append(f"• {ev.get('summary')} — {start}")
-        return "\n".join(lines)
+        if _is_google_calendar():
+            return _show_calendar_agenda_google(profile, from_datetime, to_datetime)
+        if _is_yandex_calendar():
+            return _show_calendar_agenda_yandex(profile, from_datetime, to_datetime)
+        return "Календарный провайдер не настроен."
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to read calendar: %s", exc)
-        return "Не удалось выполнить действие с Google (таблица/календарь). Я пробовал несколько раз. Попробуйте позже."
+        return "Не удалось выполнить действие с календарём. Я пробовал несколько раз. Попробуйте позже."
 
 
 # Context for AI
