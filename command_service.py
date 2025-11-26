@@ -106,6 +106,26 @@ async def execute_plan(profile: dict, plan: dict) -> CommandResult:
             or "",
         )
 
+    # Быстрый путь: если ИИ уже вернул готовый текст для чата, не дергаем модель второй раз
+    if method == "chat" and plan.get("user_visible_answer"):
+        command_result = CommandResult(user_visible_answer=str(plan["user_visible_answer"]))
+
+        # Сохранить поведение debug-режима: добавить debug-хвост при необходимости
+        try:
+            debug_user_id = int(profile.get("telegram_user_id", 0))
+        except (TypeError, ValueError):
+            debug_user_id = None
+
+        if debug_user_id is not None and debug_service.is_debug_enabled(debug_user_id):
+            debug_info = (
+                f"\n\n[debug] method={method}; confidence={confidence:.2f}; "
+                f"params_keys={list((plan.get('params') or {}).keys())}"
+            )
+            command_result.user_visible_answer = (command_result.user_visible_answer or "") + debug_info
+
+        # Для простого чата можно не писать action_log, чтобы не засорять журнал техническим шумом
+        return command_result
+
     if method == "clarify" or clarify_question:
         question_text = clarify_question or plan.get("user_visible_answer")
         fallback_text = "Я не уверен, что правильно понял запрос. Уточните, пожалуйста."

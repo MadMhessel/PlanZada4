@@ -55,7 +55,7 @@ async def _call_model(
         try:
             return response.text  # может бросить ValueError
         except Exception as e:  # noqa: BLE001
-            logger.warning("Модель не вернула .text, пробуем кандидатов: %s", e)
+            logger.debug("Модель не вернула .text, пробуем кандидатов: %s", e)
 
         try:
             candidates = getattr(response, "candidates", None) or []
@@ -93,7 +93,7 @@ async def _call_model(
                 logger.warning("Проблемная finish_reason=%r", finish_reason)
 
             if not texts:
-                logger.warning("Кандидат без текстовых частей, cand0=%r", cand0)
+                logger.debug("Кандидат без текстовых частей, cand0=%r", cand0)
                 return None
 
             return "\n".join(texts)
@@ -168,8 +168,8 @@ def build_context_for_user(profile: dict) -> str:
     except (TypeError, ValueError):
         logger.debug("Invalid telegram_user_id in profile: %r", profile.get("telegram_user_id"))
 
-    history = get_recent_history(user_id, limit=8)
-    actions_summary = get_recent_actions_summary(user_id, limit=5)
+    history = get_recent_history(user_id, limit=6)
+    actions_summary = get_recent_actions_summary(user_id, limit=3)
 
     display_name = (
         profile.get("display_name")
@@ -200,7 +200,7 @@ def build_context_for_user(profile: dict) -> str:
         + "\n\n"
         + "\n".join(actions_lines)
     )
-    return truncate_text(context, 6000)
+    return truncate_text(context, 4000)
 
 
 async def analyze_intent(profile: dict, user_text: str, context_text: str) -> dict:
@@ -378,7 +378,7 @@ async def free_chat(
     """Свободный диалог с учётом контекста и безопасным фолбэком."""
 
     resolved_question = question or "Продолжай диалог со мной."
-    resolved_context = truncate_text(context_text or build_context_for_user(profile), 4000)
+    resolved_context = truncate_text(context_text or build_context_for_user(profile), 2500)
     prompt = (
         "Ты — дружелюбный ассистент. Отвечай кратко и по делу на русском языке."
         " Используй контекст только если он необходим.\n"
