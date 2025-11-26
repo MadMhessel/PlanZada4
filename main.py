@@ -128,11 +128,28 @@ async def handle_any_message(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     google_service.update_last_seen(message.from_user.id)
-    plan = await ai_service.process_user_request(profile, message.text or "")
-    result = await command_service.execute_plan(profile, plan)
+    user_text = message.text or ""
+    try:
+        plan = await ai_service.process_user_request(profile, user_text)
+        result = await command_service.execute_plan(profile, plan)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to process incoming message: %s", exc)
+        fallback_text = "Произошла ошибка при обработке запроса. Я продолжаю работу."
+        try:
+            await message.answer(fallback_text)
+        except Exception as send_exc:  # noqa: BLE001
+            logger.warning("Failed to send fallback reply: %s", send_exc)
+        append_message(int(profile.get("telegram_user_id", 0)), "user", user_text)
+        append_message(int(profile.get("telegram_user_id", 0)), "assistant", fallback_text)
+        return
+
     reply_text = result.user_visible_answer or "Запрос обработан."
-    await message.answer(reply_text)
-    append_message(int(profile.get("telegram_user_id", 0)), "user", message.text or "")
+    try:
+        await message.answer(reply_text)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to send reply: %s", exc)
+
+    append_message(int(profile.get("telegram_user_id", 0)), "user", user_text)
     append_message(int(profile.get("telegram_user_id", 0)), "assistant", reply_text)
 
 
@@ -141,28 +158,32 @@ async def reminder_worker() -> None:
     while True:
         try:
             users = google_service.list_users()
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Error in reminder_worker while listing users: %s", exc)
-            await asyncio.sleep(CONFIG.reminder_interval_seconds)
-            continue
-
-        for user in users:
-            try:
-                if str(user.get("notify_telegram", "")).lower() not in {"true", "1", "yes", "y"}:
-                    continue
-                telegram_id = user.get("telegram_user_id")
-                if not telegram_id:
-                    continue
-                tasks = google_service.upcoming_tasks_for_user(user.get("user_id", ""))
-                if not tasks:
-                    continue
-                text = await ai_service.build_reminder_text(tasks, user)
+            for user in users:
                 try:
-                    await bot.send_message(int(telegram_id), text)
+                    if str(user.get("notify_telegram", "")).lower() not in {"true", "1", "yes", "y"}:
+                        continue
+
+                    raw_chat_id = user.get("telegram_chat_id") or user.get("telegram_user_id")
+                    try:
+                        chat_id = int(raw_chat_id)
+                    except (TypeError, ValueError):
+                        logger.warning("Пропускаю напоминание: некорректный chat_id=%r", raw_chat_id)
+                        continue
+
+                    tasks = google_service.upcoming_tasks_for_user(user.get("user_id", ""))
+                    if not tasks:
+                        continue
+
+                    text = await ai_service.build_reminder_text(tasks, user)
+                    try:
+                        await bot.send_message(chat_id=chat_id, text=text)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Failed to send reminder for user %r: %s", user, exc)
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("Failed to send reminder: %s", exc)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Error in reminder_worker for user %s: %s", user.get("user_id"), exc)
+                    logger.warning("Failed to send reminder for user %r: %s", user, exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Error in reminder_worker: %s", exc)
+
         await asyncio.sleep(CONFIG.reminder_interval_seconds)
 
 
