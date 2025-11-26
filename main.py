@@ -140,7 +140,14 @@ async def reminder_worker() -> None:
     google_service.ensure_structures()
     while True:
         try:
-            for user in google_service.list_users():
+            users = google_service.list_users()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Error in reminder_worker while listing users: %s", exc)
+            await asyncio.sleep(CONFIG.reminder_interval_seconds)
+            continue
+
+        for user in users:
+            try:
                 if str(user.get("notify_telegram", "")).lower() not in {"true", "1", "yes", "y"}:
                     continue
                 telegram_id = user.get("telegram_user_id")
@@ -154,8 +161,8 @@ async def reminder_worker() -> None:
                     await bot.send_message(int(telegram_id), text)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Failed to send reminder: %s", exc)
-        except Exception as e:  # noqa: BLE001
-            logger.exception("Error in reminder_worker: %s", e)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Error in reminder_worker for user %s: %s", user.get("user_id"), exc)
         await asyncio.sleep(CONFIG.reminder_interval_seconds)
 
 
