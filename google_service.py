@@ -11,7 +11,7 @@ from typing import Callable, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import caldav
-from icalendar import Calendar, Event
+from icalendar import Alarm, Calendar, Event, vCalAddress, vText
 from google.auth import default as google_default_credentials
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -687,6 +687,46 @@ def _get_yandex_calendar():
         raise RuntimeError("Не удалось подключиться к Яндекс.Календарю.") from exc
 
 
+def build_yandex_event_ics(
+    title: str,
+    description: str,
+    start_dt: dt.datetime,
+    end_dt: dt.datetime,
+    attendees: Optional[List[str]] = None,
+    uid: Optional[str] = None,
+) -> bytes:
+    cal = Calendar()
+    cal.add("prodid", "-//AI Secretary//YA//")
+    cal.add("version", "2.0")
+
+    event = Event()
+    event.add("uid", uid or str(uuid.uuid4()))
+    event.add("summary", title)
+    event.add("description", description)
+    event.add("dtstart", start_dt)
+    event.add("dtend", end_dt)
+    event.add("dtstamp", dt.datetime.now(dt.UTC))
+
+    organizer = vCalAddress(f"MAILTO:{CONFIG.yandex_calendar_login}")
+    event.add("organizer", organizer)
+
+    for attendee in attendees or []:
+        attendee_address = vCalAddress(f"MAILTO:{attendee}")
+        attendee_address.params["ROLE"] = vText("REQ-PARTICIPANT")
+        attendee_address.params["PARTSTAT"] = vText("NEEDS-ACTION")
+        attendee_address.params["RSVP"] = vText("TRUE")
+        event.add("attendee", attendee_address)
+
+    alarm = Alarm()
+    alarm.add("action", "DISPLAY")
+    alarm.add("description", "Напоминание")
+    alarm.add("trigger", dt.timedelta(minutes=-15))
+    event.add_component(alarm)
+
+    cal.add_component(event)
+    return cal.to_ical()
+
+
 def _create_or_update_event_google(
     profile: dict,
     title: str,
@@ -726,25 +766,17 @@ def _create_or_update_event_yandex(
     calendar = _get_yandex_calendar()
     start_dt = _parse_datetime_with_timezone(start_datetime, profile)
     end_dt = _parse_datetime_with_timezone(end_datetime, profile) if end_datetime else start_dt
-    cal = Calendar()
-    cal.add("prodid", "-//AI Secretary//YA//")
-    cal.add("version", "2.0")
-
-    event = Event()
-    uid = link_task_id or str(uuid.uuid4())
-    event.add("uid", uid)
-    event.add("summary", title)
-    desc = description if not link_task_id else f"{description}\nСвязано с задачей: {link_task_id}"
-    event.add("description", desc)
-    event.add("dtstart", start_dt)
-    event.add("dtend", end_dt)
-    for attendee in attendees or []:
-        event.add("attendee", f"MAILTO:{attendee}")
-
-    cal.add_component(event)
-    data = cal.to_ical()
-    _with_retries_caldav(calendar.add_event, data)
-    return f"Событие создано ({uid})."
+    full_description = description if not link_task_id else f"{description}\nСвязано с задачей: {link_task_id}"
+    event_ics = build_yandex_event_ics(
+        title=title,
+        description=full_description,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        attendees=attendees,
+        uid=link_task_id,
+    )
+    _with_retries_caldav(calendar.add_event, event_ics)
+    return "Событие создано в Яндекс.Календаре."
 
 
 def create_or_update_event(
@@ -759,9 +791,25 @@ def create_or_update_event(
 ) -> str:
     try:
         if _is_google_calendar():
-            return _create_or_update_event_google(profile, title, description, start_datetime, end_datetime, attendees, link_task_id)
+            return _create_or_update_event_google(
+                profile,
+                title,
+                description,
+                start_datetime,
+                end_datetime,
+                attendees,
+                link_task_id,
+            )
         if _is_yandex_calendar():
-            return _create_or_update_event_yandex(profile, title, description, start_datetime, end_datetime, attendees, link_task_id)
+            return _create_or_update_event_yandex(
+                profile,
+                title,
+                description,
+                start_datetime,
+                end_datetime,
+                attendees,
+                link_task_id,
+            )
         return "Календарный провайдер не настроен."
     except Exception as exc:  # noqa: BLE001
         logger.exception("Calendar operation failed: %s", exc)
