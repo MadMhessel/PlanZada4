@@ -30,6 +30,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _safe_append_dialog(profile: dict, role: str, text: str) -> None:
+    try:
+        user_id = int(profile.get("telegram_user_id", 0))
+    except (TypeError, ValueError):
+        logger.debug("Invalid telegram_user_id for dialog append: %r", profile.get("telegram_user_id"))
+        return
+    try:
+        append_message(user_id, role, text)
+    except Exception:  # noqa: BLE001
+        logger.debug("Failed to append dialog message", exc_info=True)
+
+
 class RegistrationStates(StatesGroup):
     display_name = State()
     email = State()
@@ -139,8 +151,8 @@ async def handle_any_message(message: Message, state: FSMContext) -> None:
             await message.answer(fallback_text)
         except Exception as send_exc:  # noqa: BLE001
             logger.warning("Failed to send fallback reply: %s", send_exc)
-        append_message(int(profile.get("telegram_user_id", 0)), "user", user_text)
-        append_message(int(profile.get("telegram_user_id", 0)), "assistant", fallback_text)
+        _safe_append_dialog(profile, "user", user_text)
+        _safe_append_dialog(profile, "assistant", fallback_text)
         return
 
     reply_text = result.user_visible_answer or "Запрос обработан."
@@ -149,8 +161,8 @@ async def handle_any_message(message: Message, state: FSMContext) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to send reply: %s", exc)
 
-    append_message(int(profile.get("telegram_user_id", 0)), "user", user_text)
-    append_message(int(profile.get("telegram_user_id", 0)), "assistant", reply_text)
+    _safe_append_dialog(profile, "user", user_text)
+    _safe_append_dialog(profile, "assistant", reply_text)
 
 
 async def reminder_worker() -> None:

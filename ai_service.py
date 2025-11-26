@@ -26,17 +26,25 @@ async def _call_model(
     temperature: float = 0.2,
     max_output_tokens: int = 512,
     extra_config: dict | None = None,
+
+    retry_without_context: bool = False,
 ) -> Optional[str]:
     """Безопасный вызов модели Gemini с обработкой всех вариантов ответа."""
 
-    def _sync_call() -> Optional[str]:
-        model = genai.GenerativeModel(CONFIG.AI_MODEL)
+    prompt = truncate_text(prompt, 12000)
+
+    def _sync_call(current_prompt: str, current_max_tokens: int) -> Optional[str]:
+        try:
+            model = genai.GenerativeModel(CONFIG.AI_MODEL)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Ошибка инициализации модели: %s", e)
+            return None
         try:
             response = model.generate_content(
-                prompt,
+                current_prompt,
                 generation_config={
                     "temperature": temperature,
-                    "max_output_tokens": max_output_tokens,
+                    "max_output_tokens": current_max_tokens,
                     **(extra_config or {}),
                 },
             )
@@ -77,6 +85,13 @@ async def _call_model(
                     if t:
                         texts.append(t)
 
+            if finish_reason == "MAX_TOKENS" and not texts:
+                logger.warning("finish_reason=MAX_TOKENS без текстовых частей")
+                return None
+
+            if finish_reason in {"SAFETY", "BLOCKED", "RECITATION", "OTHER", None}:
+                logger.warning("Проблемная finish_reason=%r", finish_reason)
+
             if not texts:
                 logger.warning("Кандидат без текстовых частей, cand0=%r", cand0)
                 return None
@@ -86,7 +101,27 @@ async def _call_model(
             logger.exception("Не удалось извлечь текст из ответа модели")
             return None
 
-    return await asyncio.to_thread(_sync_call)
+    def _extract_user_request(text: str) -> str:
+        for marker in ["=== Новый запрос пользователя ===", "=== ЗАПРОС ===", "=== ЗАПРОС ПОЛЬЗОВАТЕЛЯ ==="]:
+            if marker in text:
+                return text.split(marker, 1)[-1].strip()
+        return text
+
+    try:
+        result = await asyncio.to_thread(_sync_call, prompt, max_output_tokens)
+        if result:
+            return result
+
+        if retry_without_context:
+            user_request = _extract_user_request(prompt)
+            simple_prompt = (
+                "Ответь на следующий запрос пользователя на русском языке, кратко:\n\n"
+                f"{user_request}"
+            )
+            return await asyncio.to_thread(_sync_call, truncate_text(simple_prompt, 4000), 200)
+    except Exception:  # noqa: BLE001
+        logger.exception("Ошибка при вызове модели")
+    return None
 
 
 def _safe_json_loads(text: str) -> Optional[dict]:
@@ -103,6 +138,25 @@ def _coerce_confidence(value: Any, default: float = 0.5) -> float:
     except (TypeError, ValueError):
         result = default
     return max(0.0, min(1.0, result))
+
+
+def truncate_text(text: str, max_chars: int) -> str:
+    """
+    Если текст длиннее max_chars — обрезать его, сохранив начало и конец.
+    Пример:
+    <первые 3000 символов>\n...\n<последние 1000 символов>
+    """
+
+    if len(text) <= max_chars:
+        return text
+
+    separator = "\n...\n"
+    tail_len = min(1000, max_chars // 3)
+    head_len = max_chars - tail_len - len(separator)
+    if head_len <= 0:
+        head_len = max_chars // 2
+        tail_len = max_chars - head_len - len(separator)
+    return f"{text[:head_len]}{separator}{text[-tail_len:]}"
 
 
 def build_context_for_user(profile: dict) -> str:
@@ -146,7 +200,7 @@ def build_context_for_user(profile: dict) -> str:
         + "\n\n"
         + "\n".join(actions_lines)
     )
-    return context
+    return truncate_text(context, 6000)
 
 
 async def analyze_intent(profile: dict, user_text: str, context_text: str) -> dict:
@@ -163,7 +217,7 @@ async def analyze_intent(profile: dict, user_text: str, context_text: str) -> di
         f"=== КОНТЕКСТ ===\n{context_text}\n"
         f"=== ЗАПРОС ===\n{user_text}\n"
     )
-    raw = await _call_model(prompt, temperature=0.1, max_output_tokens=300)
+    raw = await _call_model(prompt, temperature=0.1, max_output_tokens=200)
     parsed = _safe_json_loads(raw or "")
     if not parsed:
         return {
@@ -198,8 +252,12 @@ async def extract_structure(profile: dict, user_text: str, context_text: str, in
         f"INTENT (JSON): {json.dumps(intent, ensure_ascii=False)}\n"
         f"=== ЗАПРОС ===\n{user_text}\n"
     )
-    raw = await _call_model(prompt, temperature=0.2, max_output_tokens=400)
-    parsed = _safe_json_loads(raw or "") or {}
+    try:
+        raw = await _call_model(prompt, temperature=0.2, max_output_tokens=400)
+        parsed = _safe_json_loads(raw or "") or {}
+    except Exception:  # noqa: BLE001
+        logger.warning("extract_structure failed, using defaults", exc_info=True)
+        parsed = {}
 
     result: Dict[str, Any] = {
         "title": parsed.get("title"),
@@ -255,7 +313,7 @@ async def make_plan(
         f"=== ЗАПРОС ===\n{user_text}\n"
         "Отвечай только JSON."
     )
-    raw = await _call_model(prompt, temperature=0.15, max_output_tokens=500)
+    raw = await _call_model(prompt, temperature=0.15, max_output_tokens=512)
     parsed = _safe_json_loads(raw or "") or {}
 
     method = parsed.get("method") if parsed.get("method") in allowed_methods else "chat"
@@ -266,8 +324,20 @@ async def make_plan(
         "confidence": _coerce_confidence(parsed.get("confidence"), 0.5 if method == "chat" else 0.7),
         "clarify_question": parsed.get("clarify_question"),
     }
+    if method == "chat" and not plan["params"].get("question"):
+        plan["params"]["question"] = user_text
     if method == "clarify" and not plan["clarify_question"]:
         plan["clarify_question"] = "Мне нужно уточнить детали, чтобы продолжить."
+
+    if not raw:
+        return {
+            "method": "chat",
+            "params": {"question": user_text},
+            "user_visible_answer": None,
+            "confidence": 0.5,
+            "clarify_question": None,
+        }
+
     return plan
 
 
@@ -284,7 +354,7 @@ async def review_plan(profile: dict, user_text: str, context_text: str, plan: di
         f"=== ЗАПРОС ===\n{user_text}\n"
         "Отвечай только JSON."
     )
-    raw = await _call_model(prompt, temperature=0.1, max_output_tokens=300)
+    raw = await _call_model(prompt, temperature=0.1, max_output_tokens=256)
     parsed = _safe_json_loads(raw or "")
     if not parsed:
         return {
@@ -308,59 +378,94 @@ async def free_chat(
     """Свободный диалог с учётом контекста и безопасным фолбэком."""
 
     resolved_question = question or "Продолжай диалог со мной."
-    resolved_context = context_text or build_context_for_user(profile)
+    resolved_context = truncate_text(context_text or build_context_for_user(profile), 4000)
     prompt = (
-        "Ты — дружелюбный ассистент. Отвечай кратко и по делу на русском языке.\n"
-        f"Контекст по пользователю:\n{resolved_context}\n"
-        f"Вопрос или реплика: {resolved_question}\n"
+        "Ты — дружелюбный ассистент. Отвечай кратко и по делу на русском языке."
+        " Используй контекст только если он необходим.\n"
+        f"Контекст:\n{resolved_context}\n"
+        f"Запрос: {resolved_question}\n"
     )
-    text = await _call_model(prompt, temperature=0.3, max_output_tokens=500, extra_config=kwargs.get("extra_config"))
-    return text or "Сейчас я не могу получить ответ от модели, но продолжу помогать вам по мере возможностей."
+    text = await _call_model(
+        prompt,
+        temperature=0.3,
+        max_output_tokens=400,
+        extra_config=kwargs.get("extra_config"),
+        retry_without_context=True,
+    )
+    return text or (
+        "Сейчас у меня не получается получить ответ от модели, но я продолжу помогать с задачами и "
+        "напоминаниями. Попробуйте переформулировать вопрос проще."
+    )
 
 
 async def process_user_request(profile: dict, user_text: str) -> dict:
     """Оркеструет все этапы AI и возвращает итоговый план."""
 
-    context_text = build_context_for_user(profile)
-    intent = await analyze_intent(profile, user_text, context_text)
+    fallback_plan = {
+        "method": "chat",
+        "params": {"question": user_text},
+        "user_visible_answer": None,
+        "confidence": 0.3,
+        "clarify_question": None,
+        "original_question": user_text,
+    }
 
-    if intent.get("topic") == "CHAT":
-        reply = await free_chat(profile, question=user_text, context_text=context_text)
-        return {
-            "method": "chat",
-            "params": {"question": user_text, "context_text": context_text},
-            "user_visible_answer": reply,
-            "confidence": 1.0,
-            "clarify_question": None,
-        }
+    try:
+        context_text = build_context_for_user(profile)
+        intent = await analyze_intent(profile, user_text, context_text)
 
-    structured = await extract_structure(profile, user_text, context_text, intent)
-    plan = await make_plan(profile, user_text, context_text, intent, structured)
-    review = await review_plan(profile, user_text, context_text, plan)
+        if intent.get("topic") == "CHAT":
+            reply = await free_chat(profile, question=user_text, context_text=context_text)
+            return {
+                "method": "chat",
+                "params": {"question": user_text, "context_text": context_text},
+                "user_visible_answer": reply,
+                "confidence": 1.0,
+                "clarify_question": None,
+                "original_question": user_text,
+            }
 
-    quality = review.get("quality", 0.0)
-    clarify_question = review.get("clarify_question")
+        structured = await extract_structure(profile, user_text, context_text, intent)
+        plan = await make_plan(profile, user_text, context_text, intent, structured)
+        plan.setdefault("params", {})
+        plan["original_question"] = user_text
+        review = await review_plan(profile, user_text, context_text, plan)
 
-    if quality < 0.5:
-        return {
-            "method": "clarify",
-            "params": {},
-            "user_visible_answer": clarify_question
-            or "Я не уверен, что правильно понял запрос. Уточните, пожалуйста.",
-            "confidence": quality,
-            "clarify_question": clarify_question,
-        }
+        quality = review.get("quality", 0.0)
+        clarify_question = review.get("clarify_question")
 
-    if 0.5 <= quality < 0.8 and clarify_question:
-        return {
-            "method": "clarify",
-            "params": {},
-            "user_visible_answer": clarify_question,
-            "confidence": quality,
-            "clarify_question": clarify_question,
-        }
+        if (
+            _coerce_confidence(intent.get("confidence"), 0.0) < 0.3
+            or not plan.get("method")
+            or _coerce_confidence(quality, 0.0) < 0.3
+        ):
+            return fallback_plan
 
-    return plan
+        if quality < 0.5:
+            return {
+                "method": "clarify",
+                "params": {},
+                "user_visible_answer": clarify_question
+                or "Я не уверен, что правильно понял запрос. Уточните, пожалуйста.",
+                "confidence": quality,
+                "clarify_question": clarify_question,
+                "original_question": user_text,
+            }
+
+        if 0.5 <= quality < 0.8 and clarify_question:
+            return {
+                "method": "clarify",
+                "params": {},
+                "user_visible_answer": clarify_question,
+                "confidence": quality,
+                "clarify_question": clarify_question,
+                "original_question": user_text,
+            }
+
+        return plan
+    except Exception:  # noqa: BLE001
+        logger.exception("Ошибка в process_user_request")
+        return fallback_plan
 
 
 async def build_reminder_text(tasks: list[dict], user: dict) -> str:
@@ -388,7 +493,7 @@ async def build_reminder_text(tasks: list[dict], user: dict) -> str:
 Ответ отдай одним цельным текстом на русском языке.
 """.strip()
 
-    text = await _call_model(prompt, temperature=0.2, max_output_tokens=400)
+    text = await _call_model(prompt, temperature=0.2, max_output_tokens=300)
 
     if text:
         return text.strip()

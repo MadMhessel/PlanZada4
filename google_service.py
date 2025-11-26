@@ -337,7 +337,12 @@ def create_personal_note(profile: dict, note_text: str, tags: Optional[List[str]
 def read_personal_notes(profile: dict, limit: int = 5, **_: str) -> str:
     notes = _read_values(PERSONAL_NOTES_SHEET)
     filtered = [n for n in notes if n and n[1] == str(profile.get("user_id"))]
-    filtered = list(reversed(filtered))[: int(limit)]
+    try:
+        limit_value = int(limit)
+    except (TypeError, ValueError):
+        logger.warning("Invalid limit for read_personal_notes: %r", limit)
+        limit_value = 5
+    filtered = list(reversed(filtered))[:limit_value]
     if not filtered:
         return "Заметок пока нет."
     lines = [f"• {n[2]} (теги: {n[5] if len(n)>5 else ''})" for n in filtered]
@@ -347,7 +352,12 @@ def read_personal_notes(profile: dict, limit: int = 5, **_: str) -> str:
 def search_personal_notes(profile: dict, query: str, limit: int = 5, **_: str) -> str:
     notes = _read_values(PERSONAL_NOTES_SHEET)
     filtered = [n for n in notes if n and n[1] == str(profile.get("user_id")) and query.lower() in (n[2].lower())]
-    filtered = filtered[: int(limit)]
+    try:
+        limit_value = int(limit)
+    except (TypeError, ValueError):
+        logger.warning("Invalid limit for search_personal_notes: %r", limit)
+        limit_value = 5
+    filtered = filtered[:limit_value]
     if not filtered:
         return "Ничего не найдено."
     return "\n".join(f"• {n[2]}" for n in filtered)

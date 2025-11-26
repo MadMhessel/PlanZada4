@@ -10,7 +10,7 @@ _HISTORY: Dict[int, Deque[dict]] = defaultdict(lambda: deque(maxlen=50))
 def append_message(user_id: int, role: str, text: str) -> None:
     """Store a dialog message for a user."""
     if role not in {"user", "assistant"}:
-        raise ValueError("role must be 'user' or 'assistant'")
+        return
     _HISTORY[user_id].append({"role": role, "text": text})
 
 
