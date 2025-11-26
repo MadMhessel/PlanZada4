@@ -1,8 +1,12 @@
 """Debug flag handling for users."""
 from __future__ import annotations
 
+import datetime as dt
 import logging
 from typing import Dict
+from zoneinfo import ZoneInfo
+
+import google_service
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +46,29 @@ def debug_status(profile: dict, **_: object) -> str:
         logger.warning("Invalid telegram_user_id for debug_status: %r", profile.get("telegram_user_id"))
         return "Не удалось определить статус debug режима."
     return f"Debug режим {'включен' if is_debug_enabled(user_id) else 'выключен'}."
+
+
+def create_test_calendar_event(profile: dict, **_: object) -> str:
+    tz = ZoneInfo(profile.get("timezone") or "Europe/Moscow")
+    now = dt.datetime.now(tz)
+    start = now + dt.timedelta(minutes=10)
+    end = start + dt.timedelta(minutes=30)
+    response = google_service.create_or_update_event(
+        profile,
+        title="Тестовое событие",
+        description="Проверка интеграции календаря",
+        start_datetime=start.isoformat(),
+        end_datetime=end.isoformat(),
+    )
+    return f"{response}\nНачало: {start.isoformat()}\nОкончание: {end.isoformat()}"
+
+
+def show_today_agenda(profile: dict, **_: object) -> str:
+    tz = ZoneInfo(profile.get("timezone") or "Europe/Moscow")
+    today = dt.datetime.now(tz).date()
+    start = dt.datetime.combine(today, dt.time.min, tzinfo=tz)
+    end = dt.datetime.combine(today, dt.time.max, tzinfo=tz)
+    return google_service.show_calendar_agenda(profile, start.isoformat(), end.isoformat())
 
 
 async def default_help(profile: dict, **_: object) -> str:
