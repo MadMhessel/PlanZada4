@@ -12,6 +12,7 @@ import google.generativeai as genai
 from action_log import get_recent_actions_summary
 from config import CONFIG
 from dialog_history import get_recent_history
+import google_service
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +249,20 @@ def _safe_json_loads(text: str) -> Optional[dict]:
         return None
 
 
+def _ensure_task_deadline_for_calendar(plan: dict, structured: dict) -> None:
+    """Переносит дедлайн из структуры в план, чтобы создать событие в календаре."""
+
+    if plan.get("method") not in {"create_personal_task", "create_team_task"}:
+        return
+
+    params = plan.get("params") or {}
+    due_dt = structured.get("due_datetime") or structured.get("due_datetime_local")
+
+    if due_dt and not params.get("due_datetime"):
+        params["due_datetime"] = due_dt
+        plan["params"] = params
+
+
 def _coerce_confidence(value: Any, default: float = 0.5) -> float:
     try:
         result = float(value)
@@ -286,6 +301,11 @@ def build_context_for_user(profile: dict) -> str:
 
     history = get_recent_history(user_id, limit=6)
     actions_summary = get_recent_actions_summary(user_id, limit=3)
+    try:
+        tasks_summary = google_service.build_context_for_user(profile).get("summary", "")
+    except Exception:  # noqa: BLE001
+        logger.debug("Failed to build tasks context", exc_info=True)
+        tasks_summary = "Состояние задач из таблицы недоступно."
 
     display_name = (
         profile.get("display_name")
@@ -315,6 +335,8 @@ def build_context_for_user(profile: dict) -> str:
         + "\n".join(history_lines)
         + "\n\n"
         + "\n".join(actions_lines)
+        + "\n\n"
+        + f"Сводка задач и заметок из таблиц: {tasks_summary or 'нет данных'}"
     )
     return truncate_text(context, 4000)
 
@@ -411,8 +433,12 @@ async def make_plan(
         "update_team_task",
         "list_team_tasks",
         "create_or_update_calendar_event",
+        "show_calendar_agenda",
         "write_personal_note",
+        "read_personal_notes",
         "search_personal_notes",
+        "update_personal_note",
+        "delete_personal_note",
         "chat",
         "clarify",
         "show_help",
@@ -421,8 +447,10 @@ async def make_plan(
     prompt = (
         "Ты планировщик действий. На основе intent и извлечённых данных выбери метод и параметры.\n"
         "Доступные методы: create_personal_task, update_personal_task, list_personal_tasks, create_team_task,"
-        " update_team_task, list_team_tasks, create_or_update_calendar_event, write_personal_note, search_personal_notes,"
-        " chat, clarify, show_help.\n"
+        " update_team_task, list_team_tasks, create_or_update_calendar_event, show_calendar_agenda, write_personal_note,"
+        " read_personal_notes, search_personal_notes, update_personal_note, delete_personal_note, chat, clarify, show_help.\n"
+        "Все задачи и заметки обязательно сохраняй в Google Sheets через соответствующие методы — таблицы уже созданы"
+        " (PersonalTasks, TeamTasks, PersonalNotes). Не отвечай, что нет таблицы: используй методы создания/обновления.\n"
         "Если это просто разговор — method='chat'. Если данных недостаточно — method='clarify' и задай clarify_question.\n"
         "Формат JSON ответа: {\"method\": string, \"params\": {...}, \"user_visible_answer\": string,"
         " \"confidence\": 0..1, \"clarify_question\": null|string}.\n"
@@ -549,6 +577,7 @@ async def process_user_request(profile: dict, user_text: str) -> dict:
         structured = await extract_structure(profile, user_text, context_text, intent)
         plan = await make_plan(profile, user_text, context_text, intent, structured)
         plan.setdefault("params", {})
+        _ensure_task_deadline_for_calendar(plan, structured)
         plan["original_question"] = user_text
         review = await review_plan(profile, user_text, context_text, plan)
 
