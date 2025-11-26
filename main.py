@@ -19,6 +19,7 @@ import ai_service
 import command_service
 from config import CONFIG
 import google_service
+from dialog_history import append_message
 
 LOG_PATH = Path(__file__).resolve().parent / "bot.log"
 logging.basicConfig(
@@ -127,10 +128,12 @@ async def handle_any_message(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     google_service.update_last_seen(message.from_user.id)
-    context = google_service.build_context_for_user(profile)
-    plan = await ai_service.analyze_and_plan(profile, message.text or "", context)
+    plan = await ai_service.process_user_request(profile, message.text or "")
     result = await command_service.execute_plan(profile, plan)
-    await message.answer(result.user_visible_answer or "Запрос обработан.")
+    reply_text = result.user_visible_answer or "Запрос обработан."
+    await message.answer(reply_text)
+    append_message(int(profile.get("telegram_user_id", 0)), "user", message.text or "")
+    append_message(int(profile.get("telegram_user_id", 0)), "assistant", reply_text)
 
 
 async def reminder_worker() -> None:

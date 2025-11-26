@@ -45,7 +45,7 @@ class Config:
         creds_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         project_root = Path(__file__).resolve().parent
         log_path = Path(os.getenv("DIALOG_LOG_PATH", project_root / "dialog_log.jsonl")).resolve()
-        ai_model = os.getenv("GENAI_MODEL", "gemini-3-pro-preview")
+        ai_model = os.getenv("GENAI_MODEL", "gemini-2.5-pro")
         reminder_interval = int(os.getenv("REMINDER_INTERVAL_SECONDS", "300"))
         return Config(
             telegram_token=token,
