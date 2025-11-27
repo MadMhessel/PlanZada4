@@ -132,14 +132,14 @@ async def handle_help(message: Message, state: FSMContext) -> None:
 
 @dp.message(F.text)
 async def handle_any_message(message: Message, state: FSMContext) -> None:
-    google_service.ensure_structures()
-    profile = google_service.get_user_profile(message.from_user.id)
+    await asyncio.to_thread(google_service.ensure_structures)
+    profile = await asyncio.to_thread(google_service.get_user_profile, message.from_user.id)
     if not profile:
         await _handle_registration(message, state)
         return
 
     await state.clear()
-    google_service.update_last_seen(message.from_user.id)
+    await asyncio.to_thread(google_service.update_last_seen, message.from_user.id)
     user_text = message.text or ""
     try:
         plan = await ai_service.process_user_request(profile, user_text)
@@ -168,10 +168,10 @@ async def handle_any_message(message: Message, state: FSMContext) -> None:
 
 
 async def reminder_worker() -> None:
-    google_service.ensure_structures()
+    await asyncio.to_thread(google_service.ensure_structures)
     while True:
         try:
-            users = google_service.list_users()
+            users = await asyncio.to_thread(google_service.list_users)
             for user in users:
                 try:
                     if str(user.get("notify_telegram", "")).lower() not in {"true", "1", "yes", "y"}:
@@ -181,7 +181,9 @@ async def reminder_worker() -> None:
                     if chat_id is None:
                         continue
 
-                    tasks = google_service.upcoming_tasks_for_user(user.get("user_id", ""))
+                    tasks = await asyncio.to_thread(
+                        google_service.upcoming_tasks_for_user, user.get("user_id", "")
+                    )
                     if not tasks:
                         continue
 
@@ -203,7 +205,7 @@ def handle_unhandled_exception(loop: asyncio.AbstractEventLoop, context: dict) -
 
 
 async def main() -> None:
-    google_service.ensure_structures()
+    await asyncio.to_thread(google_service.ensure_structures)
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(handle_unhandled_exception)
     asyncio.create_task(reminder_worker())
