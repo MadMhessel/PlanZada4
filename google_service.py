@@ -78,12 +78,18 @@ _yandex_calendar = None
 _users_cache: List[Dict[str, str]] | None = None
 
 
+def _get_calendar_provider() -> str:
+    return (CONFIG.calendar_provider or "google").strip().lower()
+
+
 def _is_google_calendar() -> bool:
-    return (CONFIG.calendar_provider or "yandex").lower() == "yandex"
+    provider = _get_calendar_provider()
+    return provider in {"google", "gcal", "google_calendar"}
 
 
 def _is_yandex_calendar() -> bool:
-    return (CONFIG.calendar_provider or "yandex").lower() == "yandex"
+    provider = _get_calendar_provider()
+    return provider in {"yandex", "ya", "yandex_calendar"}
 
 
 def _get_credentials():
@@ -611,10 +617,12 @@ def list_team_tasks(profile: dict, status: Optional[str] = None, **_: str) -> st
 
 
 def _calendar_configured_for_creation() -> bool:
+    provider = _get_calendar_provider()
     if _is_google_calendar():
         return bool(CONFIG.calendar_id)
     if _is_yandex_calendar():
         return bool(CONFIG.yandex_calendar_login and CONFIG.yandex_calendar_password)
+    logger.warning("Неизвестный календарный провайдер %r, создание событий отключено", provider)
     return False
 
 
@@ -801,6 +809,8 @@ def create_or_update_event(
     **_: str,
 ) -> str:
     try:
+        provider = _get_calendar_provider()
+
         if _is_google_calendar():
             return _create_or_update_event_google(
                 profile,
@@ -813,6 +823,19 @@ def create_or_update_event(
             )
         if _is_yandex_calendar():
             return _create_or_update_event_yandex(
+                profile,
+                title,
+                description,
+                start_datetime,
+                end_datetime,
+                attendees,
+                link_task_id,
+            )
+        if CONFIG.calendar_id:
+            logger.warning(
+                "Неизвестный провайдер %r, использую Google Calendar по умолчанию", provider
+            )
+            return _create_or_update_event_google(
                 profile,
                 title,
                 description,

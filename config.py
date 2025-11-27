@@ -54,7 +54,7 @@ class Config:
             raise RuntimeError("GOOGLE_SHEETS_ID is required in environment")
         calendar_id = os.getenv("GOOGLE_CALENDAR_ID")
         creds_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        calendar_provider = os.getenv("CALENDAR_PROVIDER", "yandex").lower()
+        calendar_provider = os.getenv("CALENDAR_PROVIDER", "google").lower()
         yandex_caldav_url = os.getenv("YANDEX_CALDAV_URL", "https://calendar.yandex.ru/")
         yandex_calendar_login = os.getenv("YANDEX_CALENDAR_LOGIN")
         yandex_calendar_password = os.getenv("YANDEX_CALENDAR_PASSWORD")
