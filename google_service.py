@@ -112,18 +112,19 @@ def _get_credentials():
 
 
 def _with_retries(func: Callable, *args, **kwargs):
-    for attempt in range(3):
+    max_attempts = 3
+    for attempt in range(max_attempts):
         try:
             return func(*args, **kwargs)
         except HttpError as exc:
             status = getattr(exc, "status_code", None) or getattr(exc, "resp", None)
             logger.warning("Google API error on attempt %s: %s", attempt + 1, exc)
-            if attempt >= 1:
+            if attempt >= max_attempts - 1:
                 raise
             time.sleep(1 + attempt)
         except OSError as exc:  # network issues
             logger.warning("Network error on attempt %s: %s", attempt + 1, exc)
-            if attempt >= 1:
+            if attempt >= max_attempts - 1:
                 raise
             time.sleep(1 + attempt)
 
