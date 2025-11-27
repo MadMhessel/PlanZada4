@@ -16,6 +16,14 @@ from config import CONFIG
 logger = logging.getLogger(__name__)
 
 
+def _is_debug_enabled(profile: dict) -> tuple[bool, Optional[int]]:
+    try:
+        user_id = int(profile.get("telegram_user_id", 0))
+    except (TypeError, ValueError):
+        return False, None
+    return debug_service.is_debug_enabled(user_id), user_id
+
+
 @dataclass
 class CommandResult:
     user_visible_answer: Optional[str] = None
@@ -113,12 +121,9 @@ async def execute_plan(profile: dict, plan: dict) -> CommandResult:
         command_result = CommandResult(user_visible_answer=str(plan["user_visible_answer"]))
 
         # Сохранить поведение debug-режима: добавить debug-хвост при необходимости
-        try:
-            debug_user_id = int(profile.get("telegram_user_id", 0))
-        except (TypeError, ValueError):
-            debug_user_id = None
+        debug_enabled, debug_user_id = _is_debug_enabled(profile)
 
-        if debug_user_id is not None and debug_service.is_debug_enabled(debug_user_id):
+        if debug_enabled and debug_user_id is not None:
             debug_info = (
                 f"\n\n[debug] method={method}; confidence={confidence:.2f}; "
                 f"params_keys={list((plan.get('params') or {}).keys())}"
@@ -138,7 +143,8 @@ async def execute_plan(profile: dict, plan: dict) -> CommandResult:
         handler = chat_handler
         params = {
             "question": params.get("question") or plan.get("user_visible_answer") or plan.get("original_question") or "",
-            "context_text": params.get("context_text") or ai_service.build_context_for_user(profile),
+            "context_text": params.get("context_text")
+            or await ai_service.build_context_for_user(profile),
         }
 
     try:
@@ -148,21 +154,26 @@ async def execute_plan(profile: dict, plan: dict) -> CommandResult:
             result = await _run_sync(handler, profile, **params)
         command_result = result if isinstance(result, CommandResult) else CommandResult(user_visible_answer=str(result))
         _log_action_safe(profile, method, params)
+        debug_enabled, debug_user_id = _is_debug_enabled(profile)
+        if debug_enabled:
+            logger.info(
+                "[debug] Executed method=%s with handler=%s for user_id=%s", method, getattr(handler, "__name__", handler), debug_user_id
+            )
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Command failed: %s", exc)
+        logger.exception("Command failed for method %s: %s", method, exc)
         return CommandResult(
             user_visible_answer="Во время обработки запроса произошла ошибка. Я записал её в лог и продолжу работу.",
             extra_data={"plan": plan},
         )
 
-    try:
-        debug_user_id = int(profile.get("telegram_user_id", 0))
-    except (TypeError, ValueError):
-        debug_user_id = None
+    debug_enabled, debug_user_id = _is_debug_enabled(profile)
 
-    if debug_user_id is not None and debug_service.is_debug_enabled(debug_user_id):
+    if debug_enabled and debug_user_id is not None:
         debug_info = (
             f"\n\n[debug] method={method}; confidence={confidence:.2f}; params_keys={list(params.keys())}"
         )
         command_result.user_visible_answer = (command_result.user_visible_answer or "") + debug_info
+
+    if not command_result.user_visible_answer and plan.get("user_visible_answer"):
+        command_result.user_visible_answer = str(plan.get("user_visible_answer"))
     return command_result

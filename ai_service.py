@@ -12,6 +12,7 @@ import google.generativeai as genai
 from action_log import get_recent_actions_summary
 from config import CONFIG
 from dialog_history import get_recent_history
+import debug_service
 import google_service
 
 logger = logging.getLogger(__name__)
@@ -249,6 +250,25 @@ def _safe_json_loads(text: str) -> Optional[dict]:
         return None
 
 
+def _is_debug_enabled(profile: dict) -> bool:
+    try:
+        user_id = int(profile.get("telegram_user_id", 0))
+    except (TypeError, ValueError):
+        return False
+    return debug_service.is_debug_enabled(user_id)
+
+
+def _clarify_plan(question: str) -> dict:
+    return {
+        "method": "clarify",
+        "params": {},
+        "user_visible_answer": "Мне нужно уточнить детали запроса, чтобы помочь корректно.",
+        "confidence": 0.3,
+        "clarify_question": "Расскажите подробнее, что требуется сделать?",
+        "original_question": question,
+    }
+
+
 def _ensure_task_deadline_for_calendar(plan: dict, structured: dict) -> None:
     """Переносит дедлайн из структуры в план, чтобы создать событие в календаре."""
 
@@ -290,7 +310,7 @@ def truncate_text(text: str, max_chars: int) -> str:
     return f"{text[:head_len]}{separator}{text[-tail_len:]}"
 
 
-def build_context_for_user(profile: dict) -> str:
+async def build_context_for_user(profile: dict) -> str:
     """Compose context text from profile, dialog history and recent actions."""
 
     user_id = 0
@@ -302,7 +322,8 @@ def build_context_for_user(profile: dict) -> str:
     history = get_recent_history(user_id, limit=6)
     actions_summary = get_recent_actions_summary(user_id, limit=3)
     try:
-        tasks_summary = google_service.build_context_for_user(profile).get("summary", "")
+        tasks_context = await asyncio.to_thread(google_service.build_context_for_user, profile)
+        tasks_summary = tasks_context.get("summary", "") if isinstance(tasks_context, dict) else ""
     except Exception:  # noqa: BLE001
         logger.debug("Failed to build tasks context", exc_info=True)
         tasks_summary = "Состояние задач из таблицы недоступно."
@@ -460,21 +481,21 @@ async def make_plan(
         f"=== ЗАПРОС ===\n{user_text}\n"
         "Отвечай только JSON."
     )
-    fallback_plan = {
-        "method": "chat",
-        "params": {"question": user_text},
-        "user_visible_answer": None,
-        "confidence": 0.5,
-        "clarify_question": None,
-    }
-
+    fallback_plan = _clarify_plan(user_text)
     raw = await _call_model(prompt, temperature=0.15, max_output_tokens=512)
+
+    if _is_debug_enabled(profile):
+        logger.info("[debug] Raw make_plan response: %s", raw)
+
     parsed = _safe_json_loads(raw or "") or {}
 
     if not raw or not parsed:
         return fallback_plan
 
-    method = parsed.get("method") if parsed.get("method") in allowed_methods else "chat"
+    method_raw = parsed.get("method") if isinstance(parsed.get("method"), str) else None
+    method = method_raw if method_raw in allowed_methods else None
+    if not method:
+        return fallback_plan
     plan = {
         "method": method,
         "params": parsed.get("params") or {},
@@ -486,6 +507,9 @@ async def make_plan(
         plan["params"]["question"] = user_text
     if method == "clarify" and not plan["clarify_question"]:
         plan["clarify_question"] = "Мне нужно уточнить детали, чтобы продолжить."
+
+    if _is_debug_enabled(profile):
+        logger.info("[debug] Parsed plan: %s", plan)
 
     return plan
 
@@ -527,7 +551,9 @@ async def free_chat(
     """Свободный диалог с учётом контекста и безопасным фолбэком."""
 
     resolved_question = question or "Продолжай диалог со мной."
-    resolved_context = truncate_text(context_text or build_context_for_user(profile), 2500)
+    resolved_context = truncate_text(
+        context_text or await build_context_for_user(profile), 2500
+    )
     prompt = (
         "Ты — дружелюбный ассистент. Отвечай кратко и по делу на русском языке. "
         "Используй контекст только если он действительно нужен.\n"
@@ -550,17 +576,10 @@ async def free_chat(
 async def process_user_request(profile: dict, user_text: str) -> dict:
     """Оркеструет все этапы AI и возвращает итоговый план."""
 
-    fallback_plan = {
-        "method": "chat",
-        "params": {"question": user_text},
-        "user_visible_answer": None,
-        "confidence": 0.3,
-        "clarify_question": None,
-        "original_question": user_text,
-    }
+    fallback_plan = _clarify_plan(user_text)
 
     try:
-        context_text = build_context_for_user(profile)
+        context_text = await build_context_for_user(profile)
         intent = await analyze_intent(profile, user_text, context_text)
 
         if intent.get("topic") == "CHAT":

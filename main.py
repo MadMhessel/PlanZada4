@@ -76,7 +76,7 @@ async def _finalize_registration(message: Message, state: FSMContext) -> None:
         "last_seen_at": now_iso,
         "is_active": "TRUE",
     }
-    google_service.create_or_update_user_profile(profile)
+    await asyncio.to_thread(google_service.create_or_update_user_profile, profile)
     await state.clear()
     await message.answer("Регистрация завершена, можно создавать задачи и заметки.")
 
@@ -111,7 +111,7 @@ async def _handle_registration(message: Message, state: FSMContext) -> None:
 
 @dp.message(Command("start"))
 async def handle_start(message: Message, state: FSMContext) -> None:
-    profile = google_service.get_user_profile(message.from_user.id)
+    profile = await asyncio.to_thread(google_service.get_user_profile, message.from_user.id)
     if profile:
         await message.answer("Вы уже зарегистрированы. Можно работать с задачами.")
         return
@@ -121,7 +121,7 @@ async def handle_start(message: Message, state: FSMContext) -> None:
 
 @dp.message(Command("help"))
 async def handle_help(message: Message, state: FSMContext) -> None:
-    profile = google_service.get_user_profile(message.from_user.id) or {
+    profile = await asyncio.to_thread(google_service.get_user_profile, message.from_user.id) or {
         "telegram_user_id": message.from_user.id,
         "display_name": message.from_user.full_name,
     }
@@ -191,9 +191,11 @@ async def reminder_worker() -> None:
                     try:
                         await bot.send_message(chat_id=chat_id, text=text)
                     except Exception as exc:  # noqa: BLE001
-                        logger.warning("Failed to send reminder for user %r: %s", user, exc)
+                        logger.warning(
+                            "Failed to send reminder for user_id=%s: %s", user.get("user_id"), exc
+                        )
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("Failed to send reminder for user %r: %s", user, exc)
+                    logger.warning("Failed to send reminder for user_id=%s: %s", user.get("user_id"), exc)
         except Exception as exc:  # noqa: BLE001
             logger.error("Error in reminder_worker: %s", exc)
 
