@@ -54,14 +54,14 @@ class Config:
             raise RuntimeError("GOOGLE_SHEETS_ID is required in environment")
         calendar_id = os.getenv("GOOGLE_CALENDAR_ID")
         creds_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        calendar_provider = os.getenv("CALENDAR_PROVIDER", "google").lower()
-        yandex_caldav_url = os.getenv("YANDEX_CALDAV_URL", "https://caldav.yandex.ru/")
+        calendar_provider = os.getenv("CALENDAR_PROVIDER", "yandex").lower()
+        yandex_caldav_url = os.getenv("YANDEX_CALDAV_URL", "https://calendar.yandex.ru/")
         yandex_calendar_login = os.getenv("YANDEX_CALENDAR_LOGIN")
         yandex_calendar_password = os.getenv("YANDEX_CALENDAR_PASSWORD")
         yandex_calendar_name = os.getenv("YANDEX_CALENDAR_NAME")
         project_root = Path(__file__).resolve().parent
         log_path = Path(os.getenv("DIALOG_LOG_PATH", project_root / "dialog_log.jsonl")).resolve()
-        ai_model = os.getenv("GENAI_MODEL", "gemini-2.5-pro")
+        ai_model = os.getenv("GENAI_MODEL", "gemini-2.5-flash")
         reminder_interval = int(os.getenv("REMINDER_INTERVAL_SECONDS", "300"))
         return Config(
             telegram_token=token,

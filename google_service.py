@@ -79,11 +79,11 @@ _users_cache: List[Dict[str, str]] | None = None
 
 
 def _is_google_calendar() -> bool:
-    return (CONFIG.calendar_provider or "google").lower() == "google"
+    return (CONFIG.calendar_provider or "yandex").lower() == "yandex"
 
 
 def _is_yandex_calendar() -> bool:
-    return (CONFIG.calendar_provider or "google").lower() == "yandex"
+    return (CONFIG.calendar_provider or "yandex").lower() == "yandex"
 
 
 def _get_credentials():
