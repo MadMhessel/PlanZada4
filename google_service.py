@@ -112,19 +112,12 @@ def _get_credentials():
 
 
 def _with_retries(func: Callable, *args, **kwargs):
-    max_attempts = 3
-    for attempt in range(max_attempts):
+    for attempt in range(3):
         try:
             return func(*args, **kwargs)
-        except HttpError as exc:
-            status = getattr(exc, "status_code", None) or getattr(exc, "resp", None)
+        except (HttpError, OSError) as exc:
             logger.warning("Google API error on attempt %s: %s", attempt + 1, exc)
-            if attempt >= max_attempts - 1:
-                raise
-            time.sleep(1 + attempt)
-        except OSError as exc:  # network issues
-            logger.warning("Network error on attempt %s: %s", attempt + 1, exc)
-            if attempt >= max_attempts - 1:
+            if attempt == 2:
                 raise
             time.sleep(1 + attempt)
 
@@ -407,7 +400,7 @@ def read_personal_notes(profile: dict, limit: int = 5, **_: str) -> str:
     notes = _read_values(PERSONAL_NOTES_SHEET)
     filtered = [n for n in notes if n and n[1] == str(profile.get("user_id"))]
     try:
-        limit_value = int(limit)
+        limit_value = max(1, int(limit))
     except (TypeError, ValueError):
         logger.warning("Invalid limit for read_personal_notes: %r", limit)
         limit_value = 5
@@ -418,12 +411,20 @@ def read_personal_notes(profile: dict, limit: int = 5, **_: str) -> str:
     return "\n".join(lines)
 
 
-def search_personal_notes(profile: dict, query: str, limit: int = 5, **_: str) -> str:
+def search_personal_notes(profile: dict, query: Optional[str] = None, limit: int = 5, **_: str) -> str:
     ensure_structures()
+    query_text = (query or "").strip().lower()
     notes = _read_values(PERSONAL_NOTES_SHEET)
-    filtered = [n for n in notes if n and n[1] == str(profile.get("user_id")) and query.lower() in (n[2].lower())]
+    filtered = [
+        n
+        for n in notes
+        if n
+        and n[1] == str(profile.get("user_id"))
+        and len(n) > 2
+        and query_text in (n[2].lower())
+    ]
     try:
-        limit_value = int(limit)
+        limit_value = max(1, int(limit))
     except (TypeError, ValueError):
         logger.warning("Invalid limit for search_personal_notes: %r", limit)
         limit_value = 5
@@ -531,11 +532,13 @@ def update_personal_task(profile: dict, task_id: str, fields: Dict[str, str], **
 def list_personal_tasks(profile: dict, status: Optional[str] = None, **_: str) -> str:
     ensure_structures()
     rows = _read_values(PERSONAL_TASKS_SHEET)
+    status_filter = (status or "").strip().lower()
     tasks = []
     for r in rows:
         if not r or r[1] != str(profile.get("user_id")):
             continue
-        if status and r[4] != status:
+        current_status = (r[4] if len(r) > 4 else "").lower()
+        if status_filter and current_status != status_filter:
             continue
         tasks.append(r)
     if not tasks:
@@ -601,11 +604,13 @@ def update_team_task(profile: dict, task_id: str, fields: Dict[str, str], **_: s
 def list_team_tasks(profile: dict, status: Optional[str] = None, **_: str) -> str:
     ensure_structures()
     rows = _read_values(TEAM_TASKS_SHEET)
+    status_filter = (status or "").strip().lower()
     tasks = []
     for r in rows:
         if not r:
             continue
-        if status and r[6] != status:
+        current_status = (r[6] if len(r) > 6 else "").lower()
+        if status_filter and current_status != status_filter:
             continue
         tasks.append(r)
     if not tasks:
